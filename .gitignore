@@ -1,0 +1,12 @@
+# Runtime state — never commit server identity or data
+config.json
+*.key
+*.db
+*.db-*
+server.log
+nohup.out
+__pycache__/
+*.pyc
+.DS_Store
+*.swp
+*.swo
