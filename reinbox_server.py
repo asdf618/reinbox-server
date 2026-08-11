@@ -1077,6 +1077,7 @@ def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
         nonlocal cur
         if cur and (cur["steps"] or cur["summary"]):
             turns.append({"sender": "claude", "timestamp": cur["ts"],
+                          "start": cur["start"],
                           "summary": cur["summary"] or "(no output)",
                           "steps": cur["steps"],
                           "attachments": cur.get("attachments") or []})
@@ -1110,7 +1111,8 @@ def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
                     if text and text.strip() and not text.lstrip().startswith("<"):
                         close()
                         turns.append({"sender": "me", "timestamp": ts,
-                                      "summary": text.strip(), "steps": []})
+                                      "start": ts, "summary": text.strip(),
+                                      "steps": []})
                         continue
                     # tool results and meta entries belong to the agent's turn
                     steps = [s for s in content_blocks_to_steps(content, ts)
@@ -1118,14 +1120,16 @@ def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
                     atts = blocks_to_attachments(content, tool_paths)
                     if steps or atts:
                         if cur is None:
-                            cur = {"ts": ts, "steps": [], "summary": None, "attachments": []}
+                            cur = {"ts": ts, "start": ts, "steps": [], "summary": None,
+                                   "attachments": []}
                         cur["ts"] = ts
                         cur["steps"].extend(steps)
                         cur.setdefault("attachments", []).extend(atts)
                 else:  # assistant
                     model = msg.get("model") or model
                     if cur is None:
-                        cur = {"ts": ts, "steps": [], "summary": None, "attachments": []}
+                        cur = {"ts": ts, "start": ts, "steps": [], "summary": None,
+                               "attachments": []}
                     cur["ts"] = ts
                     note_tool_paths(content, tool_paths)
                     cur.setdefault("attachments", []).extend(sent_file_attachments(content))
@@ -1378,7 +1382,8 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
     def ensure_cur(entry_ts: int) -> dict:
         nonlocal cur
         if cur is None:
-            cur = {"ts": entry_ts, "steps": [], "summary": None, "attachments": []}
+            cur = {"ts": entry_ts, "start": entry_ts, "steps": [], "summary": None,
+                   "attachments": []}
         cur["ts"] = entry_ts
         return cur
 
@@ -1386,6 +1391,7 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
         nonlocal cur
         if cur and (cur["steps"] or cur["summary"] or cur.get("attachments")):
             turns.append({"sender": "claude", "timestamp": cur["ts"],
+                          "start": cur["start"],
                           "summary": cur["summary"] or "(no output)",
                           "steps": cur["steps"],
                           "attachments": cur.get("attachments") or []})
@@ -1460,7 +1466,8 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
                             first_user = p["message"]
                         close_turn()
                         turns.append({"sender": "me", "timestamp": entry_ts,
-                                      "summary": p["message"], "steps": []})
+                                      "start": entry_ts, "summary": p["message"],
+                                      "steps": []})
                     elif et == "agent_reasoning_raw_content" and p.get("text"):
                         add_step({"type": "thought", "timestamp": entry_ts,
                                   "content": _truncate(p["text"])}, entry_ts)
@@ -1731,13 +1738,31 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                 seen = existing["last_turn_ts"] or 0
                 new_turns = [t for t in turns if t["timestamp"] > seen]
                 # A merely-touched transcript must not produce a duplicate reply.
-                last = cur.execute("""SELECT summary_output FROM messages
+                last = cur.execute("""SELECT id, timestamp, summary_output FROM messages
                     WHERE session_id = ? AND sender = 'claude'
                     ORDER BY timestamp DESC LIMIT 1""", (sid,)).fetchone()
                 got_reply = False
                 newest_ts = 0
                 last_sender = None
+                merged = False
                 for t in new_turns:
+                    if (t["sender"] == "claude" and last and not merged
+                            and t["start"] <= last["timestamp"] <= t["timestamp"]):
+                        # A reply read while the agent was still working: the
+                        # stored row sits inside this turn, so it becomes the
+                        # finished one.
+                        cur.execute("""UPDATE messages SET timestamp = ?,
+                            summary_output = ?, expanded_thoughts = ? WHERE id = ?""",
+                            (t["timestamp"], t["summary"], json.dumps(t["steps"]),
+                             last["id"]))
+                        cur.execute("DELETE FROM attachments WHERE message_id = ?",
+                                    (last["id"],))
+                        insert_attachments(cur, sid, last["id"], t.get("attachments"))
+                        merged = True
+                        newest_ts = max(newest_ts, t["timestamp"])
+                        last_sender = "claude"
+                        got_reply = True
+                        continue
                     if (t["sender"] == "claude" and last
                             and last["summary_output"] == t["summary"]):
                         continue
