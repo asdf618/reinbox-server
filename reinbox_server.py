@@ -1632,6 +1632,8 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                     turns, model = rec.get("turns") or [], rec.get("model")
                 ts = (turns[0]["timestamp"] if turns else rec.get("created_at")) or now_ms()
                 last_by = turns[-1]["sender"] if turns else "claude"
+                # A session's time is its newest message, not the file mtime.
+                last_ts = turns[-1]["timestamp"] if turns else ts
                 cur.execute("""
                 INSERT INTO sessions (id, subject, folder, model, thinking_level, status,
                     last_message_by, is_read, created_at, updated_at, claude_session_id,
@@ -1640,7 +1642,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                 """, (real_id, rec["subject"], rec["folder"], model,
                       # codex records the effort; Claude never persists it
                       rec.get("effort") or "default",
-                      "completed", last_by, 0, ts, rec["mtime"], real_id,
+                      "completed", last_by, 0, ts, last_ts, real_id,
                       rec["agent_name"], rec["mtime"]))
                 if turns:
                     for t in turns:
@@ -1667,7 +1669,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                         (str(uuid.uuid4()), real_id, ts, summary or "(imported session)",
                          json.dumps(rec.get("steps") or [])))
                 if last_by == "claude":
-                    fresh_replies.append((real_id, rec["mtime"]))
+                    fresh_replies.append((real_id, last_ts))
                 logger.info(f"Imported external session {real_id} ({rec['agent_name']}) "
                             f"in '{rec['folder']}' ({len(turns)} turns)")
             elif not existing["transcript_mtime"] and existing["origin"] != "external":
@@ -1693,6 +1695,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                     WHERE session_id = ? AND sender = 'claude'
                     ORDER BY timestamp DESC LIMIT 1""", (sid,)).fetchone()
                 got_reply = False
+                newest_ts = 0
                 for t in new_turns:
                     if (t["sender"] == "claude" and last
                             and last["summary_output"] == t["summary"]):
@@ -1704,15 +1707,16 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                         (mid, sid, t["sender"], t["timestamp"],
                          t["summary"], json.dumps(t["steps"])))
                     insert_attachments(cur, sid, mid, t.get("attachments"))
+                    newest_ts = max(newest_ts, t["timestamp"])
                     got_reply = got_reply or t["sender"] == "claude"
                 if got_reply:
                     cur.execute("""UPDATE sessions SET updated_at = ?, transcript_mtime = ?,
                         last_message_by = 'claude', is_read = 0 WHERE id = ?""",
-                        (rec["mtime"], rec["mtime"], sid))
+                        (newest_ts, rec["mtime"], sid))
                     if rec.get("effort"):  # codex tracks effort per turn
                         cur.execute("UPDATE sessions SET thinking_level = ? WHERE id = ?",
                                     (rec["effort"], sid))
-                    fresh_replies.append((sid, rec["mtime"]))
+                    fresh_replies.append((sid, newest_ts))
                     logger.info(f"Refreshed session {sid} from externally-updated transcript")
                 else:
                     cur.execute("UPDATE sessions SET transcript_mtime = ? WHERE id = ?",
