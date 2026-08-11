@@ -150,6 +150,35 @@ def _check_clients(keys: List[str]) -> None:
         seen.add(k)
 
 
+def _disk_spelling(path: str) -> str:
+    """How the filesystem writes a path. A name counts only when it reaches the
+    same directory; a path that does not exist keeps the spelling given."""
+    resolved = os.sep
+    for part in path.strip(os.sep).split(os.sep):
+        if not part:
+            continue
+        try:
+            names = os.listdir(resolved)
+            if part not in names:
+                given = os.path.join(resolved, part)
+                part = next((n for n in names
+                             if n.lower() == part.lower()
+                             and os.path.samefile(os.path.join(resolved, n), given)), part)
+        except OSError:
+            pass
+        resolved = os.path.join(resolved, part)
+    return resolved
+
+
+def _check_root_dir(value: str) -> None:
+    """Scoping matches a session's directory against this root as text."""
+    resolved = os.path.realpath(os.path.expanduser(value))
+    on_disk = _disk_spelling(resolved)
+    if on_disk != resolved:
+        raise ValueError(f'"root_dir" is {value!r}; this filesystem spells it '
+                         f'{on_disk!r}')
+
+
 def _build_config(data: dict) -> dict:
     """Optional defaults + file contents, validated, as a NEW dict. Raises on
     anything missing, ill-typed or unusable."""
@@ -168,6 +197,7 @@ def _build_config(data: dict) -> dict:
     for key in ("root_dir", "db_path"):
         if not str(cfg[key]).strip():
             raise ValueError(f'"{key}" must name a path')
+    _check_root_dir(cfg["root_dir"])
     if not all(isinstance(b, str) and b.strip() for b in cfg["bind"]):
         raise ValueError('"bind" must list addresses as strings, e.g. ["127.0.0.1"]')
     if not cfg["agents"]:
