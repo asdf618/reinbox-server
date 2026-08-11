@@ -645,6 +645,8 @@ def init_db():
         origin TEXT DEFAULT 'app', -- app (created here) | external (imported)
         -- mtime of the backing transcript, so a CLI-side resume is picked up
         transcript_mtime INTEGER DEFAULT 0,
+        -- newest turn already stored from that transcript
+        last_turn_ts INTEGER DEFAULT 0,
         -- set once a user renames, so a later agent aiTitle won't clobber it
         subject_locked INTEGER DEFAULT 0
     )
@@ -1548,6 +1550,14 @@ _LAST_RECONCILE = {"ts": 0}
 RECONCILE_THROTTLE_MS = 4000
 
 
+def advance_marks(cur, session_id: str, mtime: int, turn_ts: int) -> None:
+    """Carry a session's two transcript marks forward. Neither moves back."""
+    cur.execute("""UPDATE sessions
+        SET transcript_mtime = MAX(COALESCE(transcript_mtime, 0), ?),
+            last_turn_ts     = MAX(COALESCE(last_turn_ts, 0), ?)
+        WHERE id = ?""", (mtime, turn_ts, session_id))
+
+
 def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
     """Sync the DB with the agents' on-disk transcript stores: import sessions
     created outside the app, refresh ones whose transcript changed externally,
@@ -1570,8 +1580,8 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
     cur = conn.cursor()
     try:
         rows = cur.execute(
-            "SELECT id, claude_session_id, origin, transcript_mtime, status, subject,"
-            " subject_locked FROM sessions"
+            "SELECT id, claude_session_id, origin, transcript_mtime, last_turn_ts,"
+            " status, subject, subject_locked FROM sessions"
         ).fetchall()
 
         # An app session re-imported as 'external' (reconcile beat the runner to the
@@ -1637,13 +1647,13 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                 cur.execute("""
                 INSERT INTO sessions (id, subject, folder, model, thinking_level, status,
                     last_message_by, is_read, created_at, updated_at, claude_session_id,
-                    agent, origin, transcript_mtime)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'external', ?)
+                    agent, origin, transcript_mtime, last_turn_ts)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'external', ?, ?)
                 """, (real_id, rec["subject"], rec["folder"], model,
                       # codex records the effort; Claude never persists it
                       rec.get("effort") or "default",
                       "completed", last_by, 0, ts, last_ts, real_id,
-                      rec["agent_name"], rec["mtime"]))
+                      rec["agent_name"], rec["mtime"], last_ts))
                 if turns:
                     for t in turns:
                         mid = str(uuid.uuid4())
@@ -1673,29 +1683,30 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                 logger.info(f"Imported external session {real_id} ({rec['agent_name']}) "
                             f"in '{rec['folder']}' ({len(turns)} turns)")
             elif not existing["transcript_mtime"] and existing["origin"] != "external":
-                # First sighting of an app session's transcript: baseline the mtime
-                # WITHOUT appending, so only genuine later edits refresh it.
-                cur.execute("UPDATE sessions SET transcript_mtime = ? WHERE id = ?",
-                            (rec["mtime"], existing["id"]))
+                # First sighting of an app session's transcript: set both marks
+                # WITHOUT appending.
+                if rec["agent_type"] == "claude":
+                    turns, _tmodel = parse_claude_turns(rec["path"])
+                else:
+                    turns = rec.get("turns") or []
+                advance_marks(cur, existing["id"], rec["mtime"],
+                              max((t["timestamp"] for t in turns), default=0))
             elif rec["mtime"] > (existing["transcript_mtime"] or 0) and existing["status"] != "active":
-                # External resume: append only turns newer than our baseline.
+                # The file moved on: append the turns past the turn mark.
                 if rec["agent_type"] == "claude":
                     turns, _tmodel = parse_claude_turns(rec["path"])
                 else:
                     turns = rec.get("turns") or []
                 sid = existing["id"]
-                baseline = existing["transcript_mtime"] or 0
-                new_turns = [t for t in turns if t["timestamp"] > baseline]
-                if not new_turns and turns:
-                    # Timestamps inconclusive — fall back to the last agent turn
-                    lastc = next((t for t in reversed(turns) if t["sender"] == "claude"), None)
-                    new_turns = [lastc] if lastc else []
+                seen = existing["last_turn_ts"] or 0
+                new_turns = [t for t in turns if t["timestamp"] > seen]
                 # A merely-touched transcript must not produce a duplicate reply.
                 last = cur.execute("""SELECT summary_output FROM messages
                     WHERE session_id = ? AND sender = 'claude'
                     ORDER BY timestamp DESC LIMIT 1""", (sid,)).fetchone()
                 got_reply = False
                 newest_ts = 0
+                last_sender = None
                 for t in new_turns:
                     if (t["sender"] == "claude" and last
                             and last["summary_output"] == t["summary"]):
@@ -1708,19 +1719,21 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                          t["summary"], json.dumps(t["steps"])))
                     insert_attachments(cur, sid, mid, t.get("attachments"))
                     newest_ts = max(newest_ts, t["timestamp"])
+                    last_sender = t["sender"]
                     got_reply = got_reply or t["sender"] == "claude"
+                if newest_ts:
+                    cur.execute("UPDATE sessions SET updated_at = ?, last_message_by = ? "
+                                "WHERE id = ?", (newest_ts, last_sender, sid))
                 if got_reply:
-                    cur.execute("""UPDATE sessions SET updated_at = ?, transcript_mtime = ?,
-                        last_message_by = 'claude', is_read = 0 WHERE id = ?""",
-                        (newest_ts, rec["mtime"], sid))
+                    cur.execute("UPDATE sessions SET is_read = 0 WHERE id = ?", (sid,))
                     if rec.get("effort"):  # codex tracks effort per turn
                         cur.execute("UPDATE sessions SET thinking_level = ? WHERE id = ?",
                                     (rec["effort"], sid))
                     fresh_replies.append((sid, newest_ts))
                     logger.info(f"Refreshed session {sid} from externally-updated transcript")
-                else:
-                    cur.execute("UPDATE sessions SET transcript_mtime = ? WHERE id = ?",
-                                (rec["mtime"], sid))
+                # The mark covers every turn read, duplicates included.
+                advance_marks(cur, sid, rec["mtime"],
+                              max((t["timestamp"] for t in new_turns), default=0))
 
         for r in rows:
             real = r["claude_session_id"] or r["id"]
@@ -1849,13 +1862,14 @@ def ingest_result_db(session_id: str, claude_session_id: Optional[str], folder: 
         """, (reply_id, session_id, "claude", ts, summary, json.dumps(steps)))
         insert_attachments(cursor, session_id, reply_id, attachments)
 
-        # Baseline transcript_mtime to now: the agent wrote its transcript before
-        # exiting, and reconcile must not read that as an external edit.
+        # The agent wrote its transcript before exiting; mark it as of now so
+        # reconcile does not read it as an external edit.
         cursor.execute("""
         UPDATE sessions SET last_message_by = 'claude', updated_at = ?, status = ?,
-                            is_read = 0, transcript_mtime = ?
+                            is_read = 0
         WHERE id = ?
-        """, (ts, status, ts, session_id))
+        """, (ts, status, session_id))
+        advance_marks(cursor, session_id, ts, ts)
 
         conn.commit()
     finally:
