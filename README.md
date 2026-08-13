@@ -71,6 +71,10 @@ bypassPermissions` and `--dangerously-bypass-approvals-and-sandbox`. Runs are
 asynchronous and non-interactive: nobody is at the terminal, so an agent that
 stops to ask for permission stalls until it is cancelled.
 
+`args` is argv: one entry per argument, so a codex config override is two
+entries, `"-c"` and `"key=value"`. An entry with no leading flag is taken as
+the prompt.
+
 ## Security
 
 A paired client can execute arbitrary code as the user running Reinbox. Reinbox
