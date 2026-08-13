@@ -774,6 +774,26 @@ def _truncate(text: str, limit: int = 2000) -> str:
     return text if len(text) <= limit else text[:limit] + " …"
 
 
+# Markup an agent writes into its own reply. A block tag's span is bookkeeping;
+# a wrapper tag encloses the reply.
+AGENT_BLOCK_TAGS = ("oai-mem-citation",)
+AGENT_WRAPPER_TAGS = ("proposed_plan",)
+
+
+def strip_agent_markup(text: str) -> str:
+    """An agent's reply as prose: block tags go with their contents, wrapper
+    tags leave theirs."""
+    if not text:
+        return text
+    for tag in AGENT_BLOCK_TAGS:
+        text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.S)
+        # An opening tag with no closer: the reply was read mid-write.
+        text = re.sub(rf"<{tag}>.*\Z", "", text, flags=re.S)
+    for tag in AGENT_WRAPPER_TAGS:
+        text = re.sub(rf"</?{tag}>", "", text)
+    return text.strip()
+
+
 def content_blocks_to_steps(blocks, ts_ms: int) -> List[dict]:
     """Claude content blocks -> the app's step model: thought (thinking), call
     (tool_use), response (tool_result), message (text)."""
@@ -1405,6 +1425,9 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
 
     def add_agent_message(text: str, entry_ts: int):
         nonlocal last_agent
+        text = strip_agent_markup(text)
+        if not text:
+            return
         last_agent = text
         ensure_cur(entry_ts)["summary"] = text
         if text not in seen_msgs:
@@ -1477,10 +1500,12 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
                         add_step({"type": "call", "timestamp": entry_ts,
                                   "content": _truncate(str(p["command"]), 1200)}, entry_ts)
                     elif et == "task_complete" and p.get("last_agent_message"):
-                        last_agent = p["last_agent_message"]
-                        ensure_cur(entry_ts)
-                        if cur["summary"] is None:
-                            cur["summary"] = last_agent
+                        final = strip_agent_markup(p["last_agent_message"])
+                        if final:
+                            last_agent = final
+                            ensure_cur(entry_ts)
+                            if cur["summary"] is None:
+                                cur["summary"] = final
     except Exception as e:
         logger.error(f"Error parsing codex rollout {path}: {e}")
         return None
