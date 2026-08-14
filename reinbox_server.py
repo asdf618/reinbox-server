@@ -2127,6 +2127,7 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
         linked_real_id = False
         steps: List[dict] = []
         LIVE_STEPS[session_id] = steps  # live view for /sessions/{id}/live
+        pushed_steps = 0  # count of steps already broadcast
         result_text: Optional[str] = None
         plain_lines: List[str] = []
         attachments: List[dict] = []      # embedded files (image/pdf Reads)
@@ -2202,6 +2203,18 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
             if real_id and not linked_real_id:
                 linked_real_id = True
                 await asyncio.to_thread(link_real_session_id, session_id, real_id)
+
+            # The run's new steps go to every client as they land; whoever has this
+            # session open renders them. "from" is the batch's index in the step
+            # list, so a client that missed one leaves the list to /sessions/{id}/live.
+            if len(steps) > pushed_steps:
+                await broadcast_event({
+                    "type": "session_steps",
+                    "session_id": session_id,
+                    "from": pushed_steps,
+                    "steps": steps[pushed_steps:],
+                })
+                pushed_steps = len(steps)
 
         await process.wait()
         RUNNING_PROCESSES.pop(session_id, None)
