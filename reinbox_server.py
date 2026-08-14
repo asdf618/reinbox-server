@@ -3132,7 +3132,9 @@ if HAS_FASTAPI:
         target_dir = resolve_session_folder(folder)
         if target_dir is None:
             raise HTTPException(status_code=403, detail="Sandbox violation")
-        if not filename or os.path.basename(filename) != filename or filename.startswith("."):
+        # A name carrying a separator is out by the basename test; "." and ".."
+        # are the two that remain and name a directory, not an artifact.
+        if not filename or os.path.basename(filename) != filename or filename in (".", ".."):
             raise HTTPException(status_code=400, detail="Invalid filename")
         return os.path.join(target_dir, filename)
 
