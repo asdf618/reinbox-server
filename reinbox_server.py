@@ -1249,21 +1249,23 @@ def codex_session_roots() -> List[str]:
     return [r for r in roots if os.path.isdir(r)]
 
 
-def codex_rollout_cwd(path: str) -> Optional[str]:
-    """Cheap peek at session_meta (first non-blank line) for the cwd, so
-    out-of-workspace rollouts are skipped without a full parse."""
+def codex_rollout_head(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Cheap peek at session_meta (first non-blank line) for the rollout's cwd
+    and thread_source, so out-of-scope rollouts are skipped without a full
+    parse. A thread the agent spawned for itself reads "subagent"."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
                     continue
                 data = json.loads(line)
-                if data.get("type") == "session_meta":
-                    return (data.get("payload") or {}).get("cwd")
-                return None  # session_meta is always first; bail otherwise
+                if data.get("type") != "session_meta":
+                    break  # session_meta is always first
+                p = data.get("payload") or {}
+                return p.get("cwd"), p.get("thread_source")
     except Exception:
-        return None
-    return None
+        pass
+    return None, None
 
 
 def find_codex_rollout(thread_id: str) -> Optional[str]:
@@ -1670,8 +1672,11 @@ def discover_transcripts() -> Dict[str, dict]:
                 if not (fn.startswith("rollout-") and fn.endswith(".jsonl")):
                     continue
                 path = os.path.join(dirpath, fn)
-                # Cheap cwd peek first; only fully parse rollouts in scope.
-                if folder_for_cwd(codex_rollout_cwd(path), owner) is None:
+                # Cheap header peek first; only fully parse rollouts in scope.
+                # A subagent thread (a reviewer, a spawned worker) is the
+                # agent's own machinery and holds no conversation of the user's.
+                head_cwd, thread_source = codex_rollout_head(path)
+                if thread_source == "subagent" or folder_for_cwd(head_cwd, owner) is None:
                     continue
                 rec = parse_codex_rollout(path)
                 if not rec or not is_safe_id(rec["id"]):
