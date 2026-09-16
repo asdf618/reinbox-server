@@ -1398,6 +1398,7 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
     turns: List[dict] = []  # mirrors parse_claude_turns' structure
     cur: Optional[dict] = None
     call_paths: Dict[str, str] = {}  # function call_id -> file path (Read of an image)
+    seen_calls: Set[str] = set()  # shell runs already written as steps
 
     def ensure_cur(entry_ts: int) -> dict:
         nonlocal cur
@@ -1423,6 +1424,27 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
         steps.append(step)
         ensure_cur(entry_ts)["steps"].append(step)
 
+    def first_time_call(key: str) -> bool:
+        """True the first time a run's identifier is seen. A record carrying no
+        identifier stands on its own."""
+        if not key:
+            return True
+        if key in seen_calls:
+            return False
+        seen_calls.add(key)
+        return True
+
+    def add_user_turn(text: str, entry_ts: int):
+        nonlocal first_user
+        text = text.strip()
+        if not text:
+            return
+        if first_user is None:
+            first_user = text
+        close_turn()
+        turns.append({"sender": "me", "timestamp": entry_ts,
+                      "start": entry_ts, "summary": text, "steps": []})
+
     def add_agent_message(text: str, entry_ts: int):
         nonlocal last_agent
         text = strip_agent_markup(text)
@@ -1434,6 +1456,25 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
             seen_msgs.add(text)
             add_step({"type": "message", "timestamp": entry_ts,
                       "content": _truncate(text)}, entry_ts)
+
+    # A prompt reaches the rollout as a loose event, as a history item, or both.
+    # The loose events are the record for a file that has them.
+    loose_prompts = False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if "user_message" not in line:
+                    continue
+                try:
+                    probe = json.loads(line)
+                except Exception:
+                    continue
+                if (probe.get("payload") or {}).get("type") == "user_message":
+                    loose_prompts = True
+                    break
+    except OSError:
+        return None
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -1484,21 +1525,33 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
                                     ensure_cur(entry_ts).setdefault("attachments", []).append(att)
                 elif dtype == "event_msg":
                     et = p.get("type")
-                    if et == "user_message" and p.get("message"):
-                        if first_user is None:
-                            first_user = p["message"]
-                        close_turn()
-                        turns.append({"sender": "me", "timestamp": entry_ts,
-                                      "start": entry_ts, "summary": p["message"],
-                                      "steps": []})
+                    if et == "item_completed":
+                        item = p.get("item") or {}
+                        norm = codex_history_item(item)
+                        itype = norm.get("item_type")
+                        text = str(norm.get("text") or "")
+                        if itype == "user_message":
+                            if not loose_prompts:
+                                add_user_turn(text, entry_ts)
+                        elif itype == "agent_message" and text:
+                            add_agent_message(text, entry_ts)
+                        else:
+                            key = (codex_call_key(item.get("id"))
+                                   if itype == "command_execution" else "")
+                            if first_time_call(key):
+                                for step in codex_item_to_steps(norm, entry_ts):
+                                    add_step(step, entry_ts)
+                    elif et == "user_message" and p.get("message"):
+                        add_user_turn(str(p["message"]), entry_ts)
                     elif et == "agent_reasoning_raw_content" and p.get("text"):
                         add_step({"type": "thought", "timestamp": entry_ts,
                                   "content": _truncate(p["text"])}, entry_ts)
                     elif et == "agent_message" and p.get("message"):
                         add_agent_message(p["message"], entry_ts)
                     elif et in ("exec_command_begin", "exec_command_end") and p.get("command"):
-                        add_step({"type": "call", "timestamp": entry_ts,
-                                  "content": _truncate(str(p["command"]), 1200)}, entry_ts)
+                        if first_time_call(codex_call_key(p.get("call_id"))):
+                            add_step({"type": "call", "timestamp": entry_ts,
+                                      "content": _truncate(str(p["command"]), 1200)}, entry_ts)
                     elif et == "task_complete" and p.get("last_agent_message"):
                         final = strip_agent_markup(p["last_agent_message"])
                         if final:
@@ -1579,6 +1632,7 @@ def discover_transcripts() -> Dict[str, dict]:
         root = os.path.join(base_home, "sessions")
         if not os.path.isdir(root):
             continue
+        thread_names = codex_thread_names(base_home)
         for dirpath, _dirs, files in os.walk(root):
             for fn in files:
                 if not (fn.startswith("rollout-") and fn.endswith(".jsonl")):
@@ -1596,8 +1650,10 @@ def discover_transcripts() -> Dict[str, dict]:
                 found[rec["id"]] = {
                     "folder": folder, "path": path,
                     "mtime": int(os.path.getmtime(path) * 1000),
-                    # codex has no aiTitle — the thread id is the title
-                    "subject": rec["id"],
+                    # The name codex gave the thread, else its opening prompt.
+                    "subject": (thread_names.get(rec["id"])
+                                or (subject_from_prompt(rec["prompt"]) if rec.get("prompt")
+                                    else rec["id"])),
                     "summary": rec.get("summary"), "steps": rec.get("steps"),
                     "turns": rec.get("turns"),
                     "model": rec.get("model"), "effort": rec.get("effort"),
@@ -2041,6 +2097,66 @@ def codex_item_to_steps(item: dict, ts_ms: int) -> List[dict]:
     elif itype == "error" and item.get("message"):
         steps.append({"type": "response", "timestamp": ts_ms, "content": _truncate(item["message"], 1200)})
     return [s for s in steps if s["content"].strip()]
+
+
+def codex_thread_names(base_home: str) -> Dict[str, str]:
+    """Thread id -> the name codex gave it, from session_index.jsonl. The file is
+    append-only and a thread is renamed as it goes, so the last line for an id
+    carries its current name."""
+    names: Dict[str, str] = {}
+    try:
+        with open(os.path.join(base_home, "session_index.jsonl"), "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                tid = rec.get("id")
+                name = str(rec.get("thread_name") or "").strip()
+                if tid and name:
+                    names[tid] = name
+    except OSError:
+        pass
+    return names
+
+
+def codex_history_item(item: dict) -> dict:
+    """A rollout history item in the shape codex_item_to_steps reads."""
+    def joined(blocks) -> str:
+        if isinstance(blocks, str):
+            return blocks.strip()
+        return "\n".join(b.get("text", "") for b in (blocks or [])
+                         if isinstance(b, dict) and b.get("text")).strip()
+
+    itype = item.get("type")
+    if itype == "Reasoning":
+        text = "\n".join(t for t in (item.get("raw_content") or []) if isinstance(t, str))
+        return {"item_type": "reasoning", "text": text.strip()}
+    if itype == "AgentMessage":
+        return {"item_type": "agent_message", "text": joined(item.get("content"))}
+    if itype == "UserMessage":
+        return {"item_type": "user_message", "text": joined(item.get("content"))}
+    if itype == "CommandExecution":
+        return {"item_type": "command_execution", "command": item.get("command"),
+                "aggregated_output": item.get("aggregated_output")}
+    if itype == "FileChange":
+        return {"item_type": "file_change", "changes": list((item.get("changes") or {}).keys())}
+    if itype == "McpToolCall":
+        return {"item_type": "mcp_tool_call", "tool": item.get("tool"), "server": item.get("server")}
+    if itype == "WebSearch":
+        return {"item_type": "web_search", "query": item.get("query")}
+    if itype == "Error":
+        return {"item_type": "error", "message": item.get("message")}
+    return dict(item)
+
+
+def codex_call_key(value) -> str:
+    """Identity of one shell run in a rollout. A run is recorded twice, as a loose
+    event and as a history item, under one identifier; the call_ segment inside it
+    is shared by other runs, so the whole string names a single run."""
+    return str(value or "").strip()
 
 
 def is_placeholder(val) -> bool:
