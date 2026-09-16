@@ -1051,9 +1051,51 @@ def subject_from_prompt(prompt: Optional[str]) -> str:
     return (first[:60] + "…") if len(first) > 60 else (first or "Untitled Session")
 
 
+# Claude Code writes its own machinery into the transcript as ordinary user and
+# assistant entries. These name the ones that carry no conversation.
+SYNTHETIC_MODEL = "<synthetic>"
+NO_RESPONSE_TEXT = "No response requested."
+INTERRUPT_PREFIX = "[Request interrupted by user"
+SLASH_COMMAND_RE = re.compile(r"/[A-Za-z0-9][A-Za-z0-9_.-]*(\s|$)")
+
+
+def first_text_block(content) -> Optional[str]:
+    """The first text of a message body, which is either the text itself or a
+    list of typed blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                return b["text"]
+    return None
+
+
+def claude_typed_prompt(entry: dict) -> Optional[str]:
+    """The text the user typed in a Claude transcript user entry. None for the
+    entries the CLI writes as the user: meta injections, the summary opening a
+    compacted session, an interrupt sentinel, a slash command, and anything
+    wrapped in a <system>/<command> tag."""
+    if entry.get("isMeta") or entry.get("isCompactSummary"):
+        return None
+    text = (first_text_block((entry.get("message") or {}).get("content")) or "").strip()
+    if not text or text.startswith("<") or text.startswith(INTERRUPT_PREFIX) \
+            or SLASH_COMMAND_RE.match(text):
+        return None
+    return text
+
+
+def is_synthetic_noop(msg: dict) -> bool:
+    """Claude Code's filler reply to a turn that asked for nothing. Matches that
+    one text only: the agent's other synthetic messages (API errors, quota
+    notices) are its only word on what happened."""
+    return (msg.get("model") == SYNTHETIC_MODEL
+            and (first_text_block(msg.get("content")) or "").strip() == NO_RESPONSE_TEXT)
+
+
 def extract_claude_prompt(jsonl_path: str) -> Optional[str]:
     """First real user prompt in a Claude transcript — the imported session's
-    original message (skips meta entries and injected <system>/<command>)."""
+    original message."""
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -1063,19 +1105,11 @@ def extract_claude_prompt(jsonl_path: str) -> Optional[str]:
                     data = json.loads(line)
                 except Exception:
                     continue
-                if data.get("type") != "user" or data.get("isMeta"):
+                if data.get("type") != "user":
                     continue
-                content = (data.get("message") or {}).get("content")
-                text = None
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    for b in content:
-                        if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
-                            text = b["text"]
-                            break
-                if text and text.strip() and not text.lstrip().startswith("<"):
-                    return text.strip()
+                text = claude_typed_prompt(data)
+                if text:
+                    return text
     except Exception:
         pass
     return None
@@ -1084,10 +1118,10 @@ def extract_claude_prompt(jsonl_path: str) -> Optional[str]:
 def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
     """Split a Claude transcript into conversation turns so an imported session
     reads like an app thread instead of one folded blob:
-      me turn     = each real user prompt (meta / injected <command> skipped)
+      me turn     = each prompt the user typed
       claude turn = all the agent did until the next prompt (steps + last
                     assistant text as the reply summary).
-    Also returns the model recorded in the transcript."""
+    Also returns the model the transcript recorded for the agent's own replies."""
     turns: List[dict] = []
     cur: Optional[dict] = None
     model: Optional[str] = None
@@ -1119,19 +1153,11 @@ def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
                 content = msg.get("content")
                 ts = _iso_to_ms(data.get("timestamp"))
                 if etype == "user":
-                    text = None
-                    if not data.get("isMeta"):
-                        if isinstance(content, str):
-                            text = content
-                        elif isinstance(content, list):
-                            for b in content:
-                                if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
-                                    text = b["text"]
-                                    break
-                    if text and text.strip() and not text.lstrip().startswith("<"):
+                    text = claude_typed_prompt(data)
+                    if text:
                         close()
                         turns.append({"sender": "me", "timestamp": ts,
-                                      "start": ts, "summary": text.strip(),
+                                      "start": ts, "summary": text,
                                       "steps": []})
                         continue
                     # tool results and meta entries belong to the agent's turn
@@ -1146,7 +1172,10 @@ def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
                         cur["steps"].extend(steps)
                         cur.setdefault("attachments", []).extend(atts)
                 else:  # assistant
-                    model = msg.get("model") or model
+                    if is_synthetic_noop(msg):
+                        continue
+                    if msg.get("model") and msg["model"] != SYNTHETIC_MODEL:
+                        model = msg["model"]
                     if cur is None:
                         cur = {"ts": ts, "start": ts, "steps": [], "summary": None,
                                "attachments": []}
@@ -1181,7 +1210,10 @@ def extract_claude_last_reply(jsonl_path: str) -> Optional[str]:
                     continue
                 if data.get("type") != "assistant":
                     continue
-                content = (data.get("message") or {}).get("content")
+                msg = data.get("message") or {}
+                if is_synthetic_noop(msg):
+                    continue
+                content = msg.get("content")
                 if isinstance(content, list):
                     for b in content:
                         if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
