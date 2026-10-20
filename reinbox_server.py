@@ -41,18 +41,18 @@ logger = logging.getLogger("Reinbox")
 
 CONFIG = {}
 ACTIVE_CONNECTIONS = set()
-# One queue per viewer so clients don't steal each other's chunks; None ends it.
+# One queue per viewer; None ends the stream.
 STREAM_SUBSCRIBERS: Dict[str, Set[asyncio.Queue]] = {}
 RUNNING_PROCESSES: Dict[str, asyncio.subprocess.Process] = {}  # session_id -> live subprocess
 LIVE_STEPS: Dict[str, List[dict]] = {}  # run-in-progress steps, polled by /sessions/{id}/live
-# Turn in flight: a second send is rejected, not raced onto one transcript.
+# One in-flight turn per session.
 ACTIVE_RUNS: Set[str] = set()
-# Live runner tasks, retained so shutdown can cancel and await them.
+# Strong references for shutdown cancellation and awaiting.
 RUNNER_TASKS: Set["asyncio.Task"] = set()
-# Tombstones (id -> time): a late runner or ingest must not re-create the row.
+# Tombstones (id -> time) block late runners and ingests from recreating rows.
 DELETED_SESSIONS: Dict[str, float] = {}
 
-# Non-matching ids are rejected before reaching the filesystem or a subprocess.
+# Validate ids before filesystem access or subprocess launch.
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
@@ -61,8 +61,7 @@ def is_safe_id(value: Optional[str]) -> bool:
 
 
 def push_stream(session_id: str, text: Optional[str]):
-    """Fan a log line to every subscriber; drop-oldest per queue so one slow
-    consumer can't block the runner or its peers."""
+    """Broadcast a log line; full subscriber queues drop their oldest entry."""
     for q in list(STREAM_SUBSCRIBERS.get(session_id, ())):
         try:
             q.put_nowait(text)
@@ -76,9 +75,7 @@ def push_stream(session_id: str, text: Optional[str]):
 SKIP_DIR_NAMES = {"node_modules", "__pycache__", "venv", ".venv", "build", "dist", "target", ".gradle"}
 FOLDER_MAX_DEPTH = 3
 
-# Optional keys and their defaults. Everything security-critical is absent here
-# on purpose: each is REQUIRED in the config, so no reachable path can invent a
-# workspace, a database, a listen address or an authentication posture.
+# Optional defaults; security-critical settings are required in the config.
 OPTIONAL_CONFIG = {
     "port": 16861,
     # Sub-path when a reverse proxy routes a prefix here, e.g. "/reinbox".
@@ -88,12 +85,12 @@ OPTIONAL_CONFIG = {
     "allowed_clients": [],     # closed mode: list of client public keys (base64)
 }
 
-# Every one must be stated in the config, with this type.
+# Required config keys and types:
 #   root_dir    — scoped sessions live here (root-relative); absolute = global
 #   db_path     — the SQLite file
 #   bind        — addresses to listen on; [] = all interfaces
 #   open_server — True: knowing the server public key grants access
-#   agents      — one section per agent; type: claude | codex
+#   agents      — one section per agent; type: claude | codex | grok
 REQUIRED_CONFIG = {
     "root_dir": str,
     "db_path": str,
@@ -104,14 +101,13 @@ REQUIRED_CONFIG = {
 
 CONFIG_PATH_USED = "config.json"
 
-AGENT_TYPES = ("claude", "codex")
+AGENT_TYPES = ("claude", "codex", "grok")
 AGENT_SCOPES = ("workspace", "global")
 
 
 def _check_agents(agents: List[dict]) -> None:
-    """Each section names a launchable type, a name unique among the agents, and
-    an executable that resolves. "scope" and "home_dir" may be omitted for the
-    defaults: workspace, and the type's stock store."""
+    """Validate agent types, unique names, and executable paths.
+    Defaults: workspace scope and the type's stock data store."""
     seen: Set[str] = set()
     for a in agents:
         name = str(a.get("name") or "").strip()
@@ -151,8 +147,7 @@ def _check_clients(keys: List[str]) -> None:
 
 
 def _disk_spelling(path: str) -> str:
-    """How the filesystem writes a path. A name counts only when it reaches the
-    same directory; a path that does not exist keeps the spelling given."""
+    """Use same-file case matches for disk spelling; preserve missing path components."""
     resolved = os.sep
     for part in path.strip(os.sep).split(os.sep):
         if not part:
@@ -180,8 +175,7 @@ def _check_root_dir(value: str) -> None:
 
 
 def _build_config(data: dict) -> dict:
-    """Optional defaults + file contents, validated, as a NEW dict. Raises on
-    anything missing, ill-typed or unusable."""
+    """Return a validated config with optional defaults; reject missing or invalid values."""
     if not isinstance(data, dict):
         raise ValueError("config must be a JSON object")
     cfg = dict(OPTIONAL_CONFIG)
@@ -215,7 +209,7 @@ def _build_config(data: dict) -> dict:
 
 
 def load_config(config_path: str = "config.json") -> dict:
-    """The config is read once, at startup. Changing it means restarting."""
+    """Read config once at startup."""
     global CONFIG, CONFIG_PATH_USED
     path = Path(config_path)
     CONFIG_PATH_USED = str(path)
@@ -237,8 +231,7 @@ def load_config(config_path: str = "config.json") -> dict:
 
 
 def get_agent(name: Optional[str]) -> dict:
-    """Agent config section by name (case-insensitive); defaults to the first
-    configured agent when no name is given."""
+    """Find an agent by case-insensitive name; an omitted name selects the first agent."""
     agents = CONFIG.get("agents") or []
     if name:
         for a in agents:
@@ -256,8 +249,7 @@ def root_dir() -> str:
 
 
 def agent_scope_global(agent_cfg: Optional[dict]) -> bool:
-    """"scope": "global" means all of the agent's sessions are imported and runs
-    may target any absolute directory (root is essentially /)."""
+    """Global scope imports all agent sessions and permits any absolute run directory."""
     return bool(agent_cfg) and str(agent_cfg.get("scope", "workspace")).strip().lower() == "global"
 
 
@@ -266,8 +258,7 @@ def any_agent_global() -> bool:
 
 
 def stock_home_dirs(agent_type: str) -> List[str]:
-    """Where an agent that names no "home_dir" keeps its data. codex has several
-    candidates because its clones each pick their own."""
+    """Default data stores by agent type, including codex clone locations."""
     home = os.path.expanduser("~")
     if agent_type == "codex":
         dirs = []
@@ -275,12 +266,13 @@ def stock_home_dirs(agent_type: str) -> List[str]:
             dirs.append(os.environ["CODEX_HOME"])
         dirs.extend([os.path.join(home, ".trae", "cli"), os.path.join(home, ".codex")])
         return dirs
+    if agent_type == "grok":
+        return [os.path.expanduser(os.environ.get("GROK_HOME") or os.path.join(home, ".grok"))]
     return [os.path.join(home, ".claude")]
 
 
 def agent_home_dirs(agent_cfg: Optional[dict]) -> List[str]:
-    """One agent's data dirs: its own "home_dir", else the stock ones for its
-    type."""
+    """Data directories for an agent: configured home_dir or its type's defaults."""
     configured = str((agent_cfg or {}).get("home_dir") or "").strip()
     if configured:
         return [os.path.expanduser(configured)]
@@ -293,8 +285,7 @@ def agents_of_type(agent_type: str) -> List[dict]:
 
 
 def homes_for_type(agent_type: str) -> List[str]:
-    """Every data dir any agent of this type could be using — for lookups and
-    deletion, which must search all of them."""
+    """All data stores for an agent type, for lookup and deletion."""
     dirs: List[str] = []
     for a in agents_of_type(agent_type):
         for d in agent_home_dirs(a):
@@ -314,10 +305,8 @@ def codex_home_dirs() -> List[str]:
 
 
 def agent_store_pairs(agent_type: str) -> List[Tuple[dict, str]]:
-    """(agent, home) pairs for discovery, so each transcript is attributed and
-    scope-checked against the agent that actually owns its store. A store is
-    claimed by the first agent listing it, keeping attribution deterministic when
-    two agents of one type name no home_dir and share the stock candidates."""
+    """Return (agent, home) pairs for discovery and scope checks.
+    The first agent listing a shared store owns it."""
     pairs: List[Tuple[dict, str]] = []
     claimed = set()
     for a in agents_of_type(agent_type):
@@ -329,14 +318,10 @@ def agent_store_pairs(agent_type: str) -> List[Tuple[dict, str]]:
     return pairs
 
 
-# X25519 server keypair. Every request carries a one-time HMAC binding method,
-# path, query and body, and every payload is AES-GCM encrypted in both modes, so
-# nothing readable travels on the wire, keys included.
-#   Open mode:   keys derived from the server PUBLIC key — possessing it is the
-#                credential, no identity.
-#   Closed mode: per-client ECDH keys; the client key must be in allowed_clients.
-#                The server's own key is an implicit client — only the key-file
-#                holder can derive its keys (the --notify trigger).
+# X25519 keys for HMAC authentication and AES-GCM payload encryption.
+# Open mode: possession of the server public key grants access.
+# Closed mode: per-client ECDH requires an allowed client key.
+# The server key is an implicit client; --notify uses its private key file.
 
 SERVER_PRIV = None          # X25519PrivateKey
 SERVER_PUB_B64 = ""
@@ -367,9 +352,8 @@ def _write_key_file(path: str, b64: str):
 
 
 def ensure_server_keys():
-    """Load the server X25519 private key from its key file, generating one
-    (0600) on first run. Key material lives only in that file, never in the
-    config."""
+    """Load the X25519 private key, creating a 0600 key file if absent.
+    Key material is stored separately from config."""
     global SERVER_PRIV, SERVER_PUB_B64
     if not HAS_CRYPTO:
         logger.error("python 'cryptography' package missing — install it "
@@ -410,15 +394,14 @@ def ensure_server_keys():
 
 
 def client_registered(client_pub_b64: str) -> bool:
-    """The server's own key is an implicit client: deriving its keys needs the
-    key file, readable only by same-host tools (--notify)."""
+    """Allowed clients include the server key; --notify uses its private key file."""
     return (client_pub_b64 == SERVER_PUB_B64
             or client_pub_b64 in (CONFIG.get("allowed_clients") or []))
 
 
 def derive_client_keys(client_pub_b64: str) -> Tuple[bytes, bytes]:
-    """ECDH(server_priv, client_pub) -> (hmac auth key, aes-gcm key). Registered
-    keys only: an unknown key must not cost a scalar mult or a cache entry."""
+    """Derive (HMAC, AES-GCM) keys via ECDH.
+    Reject unregistered keys before scalar multiplication or caching."""
     if not client_registered(client_pub_b64):
         raise ValueError("unregistered client key")
     cached = _CLIENT_KEY_CACHE.get(client_pub_b64)
@@ -438,21 +421,14 @@ def derive_client_keys(client_pub_b64: str) -> Tuple[bytes, bytes]:
 
 
 def http_sign_payload(method: str, path: str, query: str, wire_body: bytes) -> str:
-    """The signed string (after the timestamp): method, transmitted path, raw
-    query, and a hash of the wire body (ciphertext when encrypted). Binding all
-    of them stops a captured signature being replayed against a different route,
-    target or body. WebSocket connects sign the literal "/ws" instead (no
-    method/query/body to bind; the frames are encrypted)."""
+    """Signed HTTP fields after the timestamp: method, wire path, raw query,
+    and SHA-256 of the wire body. WebSocket upgrades sign the literal "/ws"."""
     return f"{method}:{path}:{query}:{hashlib.sha256(wire_body).hexdigest()}"
 
 
 def consume_signature(sig: str) -> bool:
-    """One-time signatures: a verified value is remembered for its validity
-    window and rejected if seen again (returns False). Expired entries are safe
-    to forget (the timestamp check would reject them anyway). Hard-capped: over
-    the limit, expired entries drop and — if still over — the oldest evict FIFO
-    (a memory-DoS guard; _SEEN_SIGS is insertion-ordered so iteration is oldest
-    first)."""
+    """Reject cached signatures. Retain entries for twice the timestamp window.
+    At capacity, remove expired entries, then evict oldest-first."""
     now = time.time()
     if len(_SEEN_SIGS) >= _SEEN_SIGS_CAP:
         for k, exp in list(_SEEN_SIGS.items()):
@@ -480,8 +456,7 @@ def verify_client_signature(client_pub: str, ts: str, sig: str, payload: str) ->
 
 
 def verify_open_signature(ts: str, sig: str, payload: str) -> bool:
-    """Open scheme: HMAC key derived from the server public key, so a valid
-    signature proves the caller knows it. Rejected on closed servers."""
+    """Verify possession of the server public key; accepted only in open mode."""
     if OPEN_AUTH_KEY is None or not CONFIG.get("open_server", True):
         return False
     try:
@@ -494,8 +469,7 @@ def verify_open_signature(ts: str, sig: str, payload: str) -> bool:
 
 
 def payload_enc_key(client_pub: Optional[str]) -> bytes:
-    """Per-client ECDH key for closed-style requests, the public-key-derived key
-    for open-style ones."""
+    """Select per-client ECDH keys or open-mode public-key-derived keys."""
     if client_pub:
         return derive_client_keys(client_pub)[1]
     return OPEN_ENC_KEY
@@ -515,8 +489,7 @@ def now_ms() -> int:
 
 
 def _forget_run(session_id: str):
-    """Drop every trace of a run from memory, once. The end-of-stream sentinel
-    releases live viewers waiting on a queue that will never deliver again."""
+    """Clear run state and send end-of-stream to live viewers."""
     RUNNING_PROCESSES.pop(session_id, None)
     ACTIVE_RUNS.discard(session_id)
     push_stream(session_id, None)
@@ -525,9 +498,8 @@ def _forget_run(session_id: str):
 
 
 async def stop_run(session_id: str, grace: float = 3.0, interrupted: bool = True) -> bool:
-    """Stop a session's agent and forget the run. The agent owns its process
-    group and may ignore SIGTERM, so this escalates to SIGKILL and waits for the
-    process to be reaped before returning. Returns True if one was running."""
+    """Stop the agent's process group, escalating SIGTERM to SIGKILL, and reap it.
+    Return True if an agent was running."""
     proc = RUNNING_PROCESSES.get(session_id)
     if proc is None:
         _forget_run(session_id)
@@ -543,7 +515,6 @@ async def stop_run(session_id: str, grace: float = 3.0, interrupted: bool = True
         except (ProcessLookupError, PermissionError):
             pass
     try:
-        # Also reaps, so no zombie is left behind to confuse a later signal.
         await asyncio.wait_for(proc.wait(), grace)
     except (asyncio.TimeoutError, TimeoutError):
         if pgid is not None:
@@ -565,9 +536,8 @@ async def stop_run(session_id: str, grace: float = 3.0, interrupted: bool = True
 
 
 def repair_stale_active_sessions():
-    """Rows left 'active' by a process that died: nothing runs them now, and
-    reconcile skips active rows. Runs before the first reconcile, while
-    RUNNING_PROCESSES is necessarily empty."""
+    """Repair stale active rows before initial reconciliation.
+    Requires an empty RUNNING_PROCESSES; reconciliation skips active rows."""
     try:
         conn = get_db()
         cur = conn.execute("UPDATE sessions SET status = 'cancelled' WHERE status = 'active'")
@@ -580,8 +550,7 @@ def repair_stale_active_sessions():
 
 
 def mark_session_interrupted(session_id: str):
-    """A run that died without producing a result: 'active' reads as "still
-    working" in the client, and reconcile skips active rows."""
+    """Mark a run without a result as interrupted; reconciliation skips active rows."""
     try:
         conn = get_db()
         conn.execute("""UPDATE sessions SET status = 'cancelled', updated_at = ?
@@ -603,9 +572,8 @@ def claude_project_dirs(abs_folder: str) -> List[str]:
 
 
 def resolve_in_root(rel_path: str) -> Optional[str]:
-    """Resolve a scoped (no leading /) path strictly inside root_dir; None if it
-    escapes. Uses commonpath so a sibling like '/root-evil' can't pass as a
-    prefix match."""
+    """Resolve a relative path inside root_dir; return None for escapes.
+    Containment uses path components, including resolved symlinks."""
     if rel_path is None or os.path.isabs(rel_path):
         return None
     root = root_dir()
@@ -620,9 +588,8 @@ def resolve_in_root(rel_path: str) -> Optional[str]:
 
 def resolve_session_folder(folder: Optional[str],
                            agent_cfg: Optional[dict] = None) -> Optional[str]:
-    """Absolute run directory for a folder value. No leading / -> scoped, inside
-    root_dir. Leading / -> full path, honored only for a global-scope agent (or,
-    with no agent in play — artifacts — if any agent is global)."""
+    """Resolve a run directory. Relative folders stay inside root_dir.
+    Absolute folders require global scope, or any global agent for artifacts."""
     if folder and os.path.isabs(folder):
         ok = agent_scope_global(agent_cfg) if agent_cfg else any_agent_global()
         if not ok:
@@ -633,8 +600,7 @@ def resolve_session_folder(folder: Optional[str],
 
 
 def abs_folder_path(folder: Optional[str]) -> str:
-    """Filesystem path for a folder: itself when absolute (global), else
-    root_dir/<folder>."""
+    """Resolve a folder relative to root_dir, preserving absolute folders."""
     f = folder or ""
     if os.path.isabs(f):
         return os.path.normpath(f)
@@ -646,11 +612,10 @@ def get_db():
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    # Both pragmas are per-connection, and foreign_keys is silently ignored
-    # inside a transaction: they belong here, before any statement runs.
-    # ON DELETE CASCADE carries a session's messages and attachments with it.
+    # Per-connection pragmas; foreign_keys must be set outside a transaction.
+    # Session deletion cascades to messages and attachments.
     conn.execute("PRAGMA foreign_keys=ON")
-    # A writer waits up to 5s for a busy database before it gives up.
+    # Busy timeout: 5 seconds.
     conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
@@ -693,8 +658,7 @@ def init_db():
         FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
     )
     """)
-    # Per-turn effort is NOT persisted per message (Claude Code doesn't track it);
-    # only the session's latest is kept in sessions.thinking_level.
+    # Only the session's latest effort is stored; Claude does not persist per-turn effort.
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
@@ -709,8 +673,7 @@ def init_db():
         FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
     )
     """)
-    # The session list orders by updated_at and reads each session's newest
-    # message; the thread view and the fork copy read one message's row set.
+    # Indexes for session ordering, newest-message lookup, thread views, and forks.
     cursor.execute("""
     CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC)
     """)
@@ -732,8 +695,7 @@ def get_claude_project_identifier(abs_path: str) -> str:
 
 
 def find_session_jsonl(session_id: str, folder_rel: str) -> Optional[str]:
-    """Exact-match transcript lookup only — a wrong mtime guess would let the
-    delete endpoint remove someone else's transcript."""
+    """Exact-id transcript lookup; deletion requires an unambiguous match."""
     if not is_safe_id(session_id):
         return None
     folder_rel = folder_rel or ""
@@ -747,8 +709,7 @@ def find_session_jsonl(session_id: str, folder_rel: str) -> Optional[str]:
 
 
 def get_real_session_id(app_id: str) -> Optional[str]:
-    """App session id -> the CLI's real session id (Claude uuid / codex thread
-    id) for resume."""
+    """Map app session id to the CLI session id for resume."""
     conn = get_db()
     try:
         row = conn.execute("SELECT claude_session_id FROM sessions WHERE id = ?", (app_id,)).fetchone()
@@ -774,20 +735,18 @@ def _truncate(text: str, limit: int = 2000) -> str:
     return text if len(text) <= limit else text[:limit] + " …"
 
 
-# Markup an agent writes into its own reply. A block tag's span is bookkeeping;
-# a wrapper tag encloses the reply.
+# Reply markup: block tags contain bookkeeping; wrapper tags contain prose.
 AGENT_BLOCK_TAGS = ("oai-mem-citation",)
 AGENT_WRAPPER_TAGS = ("proposed_plan",)
 
 
 def strip_agent_markup(text: str) -> str:
-    """An agent's reply as prose: block tags go with their contents, wrapper
-    tags leave theirs."""
+    """Strip block tags with their contents and wrapper tags without their contents."""
     if not text:
         return text
     for tag in AGENT_BLOCK_TAGS:
         text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.S)
-        # An opening tag with no closer: the reply was read mid-write.
+        # An unclosed tag can occur in a transcript read mid-write.
         text = re.sub(rf"<{tag}>.*\Z", "", text, flags=re.S)
     for tag in AGENT_WRAPPER_TAGS:
         text = re.sub(rf"</?{tag}>", "", text)
@@ -795,8 +754,7 @@ def strip_agent_markup(text: str) -> str:
 
 
 def content_blocks_to_steps(blocks, ts_ms: int) -> List[dict]:
-    """Claude content blocks -> the app's step model: thought (thinking), call
-    (tool_use), response (tool_result), message (text)."""
+    """Map Claude content blocks to thought, call, response, and message steps."""
     steps = []
     if isinstance(blocks, str):
         if blocks.strip():
@@ -823,7 +781,7 @@ def content_blocks_to_steps(blocks, ts_ms: int) -> List[dict]:
             content = block.get("content")
             if isinstance(content, list):
                 content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
-            # Skip text-less embedded-media results: a bare dot on a blank line.
+            # Text-less media results contain a lone dot.
             if str(content or "").strip():
                 steps.append({"type": "response", "timestamp": ts_ms, "content": _truncate(str(content or ""), 1200)})
     return steps
@@ -831,7 +789,7 @@ def content_blocks_to_steps(blocks, ts_ms: int) -> List[dict]:
 
 MAX_PROMPT_CHARS = 500_000  # bounds a single-request memory hit
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
-# Same bound for artifacts: every payload must buffer-and-encrypt in memory.
+# Artifacts are buffered and encrypted in memory.
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 _MEDIA_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
               "image/webp": ".webp", "image/svg+xml": ".svg", "application/pdf": ".pdf"}
@@ -857,8 +815,7 @@ def _embedded_block_to_attachment(b, src_path: Optional[str]) -> Optional[dict]:
 
 
 def data_url_to_attachment(url: str, src_path: Optional[str]) -> Optional[dict]:
-    """A data: URL -> attachment record (codex embeds viewed images as
-    input_image items with data URLs)."""
+    """Decode a data URL attachment, including codex input_image items."""
     if not isinstance(url, str) or not url.startswith("data:"):
         return None
     head, _, b64 = url.partition(",")
@@ -877,9 +834,8 @@ def data_url_to_attachment(url: str, src_path: Optional[str]) -> Optional[dict]:
 
 
 def blocks_to_attachments(blocks, tool_paths: Optional[Dict[str, str]] = None) -> List[dict]:
-    """Embedded binary blocks in Claude content -> attachment records (a Read of
-    an image/PDF lands as a base64 block in the tool_result). tool_paths maps
-    tool_use_id -> the Read's file path so the attachment keeps its filename."""
+    """Extract attachments from embedded Claude image/PDF blocks.
+    tool_paths maps tool_use_id to source filenames."""
     out: List[dict] = []
     if not isinstance(blocks, list):
         return out
@@ -895,7 +851,7 @@ def blocks_to_attachments(blocks, tool_paths: Optional[Dict[str, str]] = None) -
                     if att:
                         out.append(_name_from_last_read(att, tool_paths))
         else:
-            # Bare embed, no tool_use_id (a PDF Read): name it from the last Read.
+            # PDF Reads may omit tool_use_id.
             att = _embedded_block_to_attachment(block, None)
             if att:
                 out.append(_name_from_last_read(att, tool_paths))
@@ -903,9 +859,7 @@ def blocks_to_attachments(blocks, tool_paths: Optional[Dict[str, str]] = None) -
 
 
 def _name_from_last_read(att: dict, tool_paths: Optional[Dict[str, str]]) -> dict:
-    """For an embedded block with no id-matched source path, adopt the last Read
-    file's name — but only if its extension agrees with the block's media type
-    (never name a PNG after an unrelated Read)."""
+    """Use the last Read filename only when its extension matches the media type."""
     last = (tool_paths or {}).get("__last__")
     if not last or att.get("path"):
         return att
@@ -917,16 +871,12 @@ def _name_from_last_read(att: dict, tool_paths: Optional[Dict[str, str]]) -> dic
     return att
 
 
-# Explicitly SENT files embed their bytes, so they survive the source being
-# deleted. A file too big to embed is skipped: a response is encrypted whole in
-# memory, so its bytes could not be served anyway.
+# Explicitly sent files embed bytes up to the encrypted-response size limit.
 MAX_SENT_EMBED_BYTES = MAX_ATTACHMENT_BYTES
 
 
 def sent_file_attachments(blocks) -> List[dict]:
-    """Explicit attach intent: a SendUserFile tool_use (some Claude harnesses)
-    names files the agent chose to SEND to the user — unlike an embedded Read,
-    which is just the agent looking at a file."""
+    """Extract files explicitly sent via SendUserFile tool calls."""
     out: List[dict] = []
     if not isinstance(blocks, list):
         return out
@@ -955,9 +905,8 @@ def sent_file_attachments(blocks) -> List[dict]:
 
 
 def note_tool_paths(blocks, tool_paths: Dict[str, str]):
-    """Record tool_use id -> file path for file-reading tools, to name any
-    attachment their result embeds. "__last__" tracks the most recent read for
-    embeds that arrive without a tool_use_id."""
+    """Track file-reading tool ids and paths for attachment names.
+    "__last__" supplies a path for results without a tool_use_id."""
     if not isinstance(blocks, list):
         return
     for b in blocks:
@@ -970,8 +919,7 @@ def note_tool_paths(blocks, tool_paths: Dict[str, str]):
 
 
 def dedup_attachments(atts: List[dict]) -> List[dict]:
-    """A file read twice in a turn embeds twice — keep one per (name, size). If
-    any duplicate was explicitly SENT, the kept record counts as sent."""
+    """Deduplicate attachments by (name, size), preserving explicit sent status."""
     seen: Dict[tuple, dict] = {}
     out = []
     for a in atts:
@@ -997,8 +945,7 @@ def insert_attachments(cursor, session_id: str, message_id: str, atts: Optional[
 
 
 def parse_jsonl_thoughts(jsonl_path: str) -> List[dict]:
-    """Parse Claude Code's transcript (user/assistant entries with
-    message.content arrays) into the app's step list."""
+    """Parse Claude transcript message.content arrays into steps."""
     if not jsonl_path or not os.path.exists(jsonl_path):
         return []
 
@@ -1051,8 +998,7 @@ def subject_from_prompt(prompt: Optional[str]) -> str:
     return (first[:60] + "…") if len(first) > 60 else (first or "Untitled Session")
 
 
-# Claude Code writes its own machinery into the transcript as ordinary user and
-# assistant entries. These name the ones that carry no conversation.
+# CLI-generated transcript entries excluded from the conversation.
 SYNTHETIC_MODEL = "<synthetic>"
 NO_RESPONSE_TEXT = "No response requested."
 INTERRUPT_PREFIX = "[Request interrupted by user"
@@ -1060,8 +1006,7 @@ SLASH_COMMAND_RE = re.compile(r"/[A-Za-z0-9][A-Za-z0-9_.-]*(\s|$)")
 
 
 def first_text_block(content) -> Optional[str]:
-    """The first text of a message body, which is either the text itself or a
-    list of typed blocks."""
+    """First text from a string or list of content blocks."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -1072,10 +1017,8 @@ def first_text_block(content) -> Optional[str]:
 
 
 def claude_typed_prompt(entry: dict) -> Optional[str]:
-    """The text the user typed in a Claude transcript user entry. None for the
-    entries the CLI writes as the user: meta injections, the summary opening a
-    compacted session, an interrupt sentinel, a slash command, and anything
-    wrapped in a <system>/<command> tag."""
+    """Extract user-authored text, excluding CLI metadata, compaction summaries,
+    interrupts, slash commands, and system/command tags."""
     if entry.get("isMeta") or entry.get("isCompactSummary"):
         return None
     text = (first_text_block((entry.get("message") or {}).get("content")) or "").strip()
@@ -1086,16 +1029,13 @@ def claude_typed_prompt(entry: dict) -> Optional[str]:
 
 
 def is_synthetic_noop(msg: dict) -> bool:
-    """Claude Code's filler reply to a turn that asked for nothing. Matches that
-    one text only: the agent's other synthetic messages (API errors, quota
-    notices) are its only word on what happened."""
+    """Match only the CLI's empty-turn filler; preserve API errors and quota notices."""
     return (msg.get("model") == SYNTHETIC_MODEL
             and (first_text_block(msg.get("content")) or "").strip() == NO_RESPONSE_TEXT)
 
 
 def extract_claude_prompt(jsonl_path: str) -> Optional[str]:
-    """First real user prompt in a Claude transcript — the imported session's
-    original message."""
+    """First user-authored prompt in a Claude transcript."""
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -1116,12 +1056,9 @@ def extract_claude_prompt(jsonl_path: str) -> Optional[str]:
 
 
 def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
-    """Split a Claude transcript into conversation turns so an imported session
-    reads like an app thread instead of one folded blob:
-      me turn     = each prompt the user typed
-      claude turn = all the agent did until the next prompt (steps + last
-                    assistant text as the reply summary).
-    Also returns the model the transcript recorded for the agent's own replies."""
+    """Split Claude transcripts into user prompts and agent turns.
+    Agent turns contain steps and the last assistant text as a summary.
+    Also return the model recorded for assistant replies."""
     turns: List[dict] = []
     cur: Optional[dict] = None
     model: Optional[str] = None
@@ -1171,7 +1108,7 @@ def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
                         cur["ts"] = ts
                         cur["steps"].extend(steps)
                         cur.setdefault("attachments", []).extend(atts)
-                else:  # assistant
+                else:
                     if is_synthetic_noop(msg):
                         continue
                     if msg.get("model") and msg["model"] != SYNTHETIC_MODEL:
@@ -1183,7 +1120,7 @@ def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
                     note_tool_paths(content, tool_paths)
                     cur.setdefault("attachments", []).extend(sent_file_attachments(content))
                     cur["steps"].extend(content_blocks_to_steps(content, ts))
-                    # Full (untruncated) reply text for the bubble
+                    # Untruncated reply text for the bubble.
                     if isinstance(content, list):
                         for b in content:
                             if isinstance(b, dict) and b.get("type") == "text" \
@@ -1196,8 +1133,7 @@ def parse_claude_turns(jsonl_path: str) -> Tuple[List[dict], Optional[str]]:
 
 
 def extract_claude_last_reply(jsonl_path: str) -> Optional[str]:
-    """Last assistant text block in a Claude transcript — the reply preview for
-    imported sessions."""
+    """Last assistant text block, for imported-session previews."""
     last = None
     try:
         with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -1249,41 +1185,20 @@ def codex_session_roots() -> List[str]:
     return [r for r in roots if os.path.isdir(r)]
 
 
-def codex_rollout_head(path: str) -> Tuple[Optional[str], Optional[str]]:
-    """Cheap peek at session_meta (first non-blank line) for the rollout's cwd
-    and thread_source, so out-of-scope rollouts are skipped without a full
-    parse. A thread the agent spawned for itself reads "subagent"."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                data = json.loads(line)
-                if data.get("type") != "session_meta":
-                    break  # session_meta is always first
-                p = data.get("payload") or {}
-                return p.get("cwd"), p.get("thread_source")
-    except Exception:
-        pass
-    return None, None
-
-
 def find_codex_rollout(thread_id: str) -> Optional[str]:
-    """Locate a codex thread's rollout file across the session stores."""
+    """Locate the current physical head of a logical codex session."""
     if not is_safe_id(thread_id):
         return None
-    for root in codex_session_roots():
-        for dirpath, _dirs, files in os.walk(root):
-            for fn in files:
-                if fn.startswith("rollout-") and fn.endswith(f"-{thread_id}.jsonl"):
-                    return os.path.join(dirpath, fn)
+    for home in codex_home_dirs():
+        info = codex_rollout_index(home)["heads"].get(thread_id)
+        if info and not info["error"]:
+            return info["path"]
     return None
 
 
 def codex_rollout_run_info(thread_id: str) -> Tuple[Optional[str], Optional[str], List[dict]]:
-    """(model, effort, last-turn attachments) of a codex run, read from its
-    rollout — the --json stdout stream states none of them. Effort is the
-    latest turn_context value (codex tracks it per turn)."""
+    """Read (model, effort, last-turn attachments) from a codex rollout.
+    Effort is the latest turn_context value; stdout omits these fields."""
     path = find_codex_rollout(thread_id)
     if not path:
         return None, None, []
@@ -1309,15 +1224,13 @@ def _prune_empty_dirs(path: str, stop_at: str):
 
 
 def delete_claude_session_files(real_id: str, folder_rel: str):
-    """Remove every Claude Code trace of a session (by real id): transcript,
-    per-session sidecar dirs, and any now-empty workspace project dir. Memory
-    dirs with content are preserved."""
+    """Remove a Claude session's transcript, sidecars, and empty project directories.
+    Preserve nonempty memory directories."""
     if not is_safe_id(real_id):
         return
     import glob as _glob
 
-    # 1) transcript — found by id across ALL project dirs (a stale stored folder
-    #    can't strand it).
+    # Search all project directories by id; stored folders may be stale.
     proj_dirs = set()
     for root in claude_home_dirs():
         for jsonl in _glob.glob(os.path.join(root, "projects", "*", f"{real_id}.jsonl")):
@@ -1334,9 +1247,7 @@ def delete_claude_session_files(real_id: str, folder_rel: str):
                 shutil.rmtree(sdir, ignore_errors=True)
                 logger.info(f"Deleted session dir {sdir}")
 
-    # 2) per-session sidecar files/dirs, named "<id>" or "<id>" plus a delimited
-    #    suffix ("<id>-agent-<id>.json"). The delimiter keeps a short id from
-    #    matching a longer neighbour ("a" vs "abc-...").
+    # Sidecars match the exact id or a delimited suffix.
     for root in claude_home_dirs():
         for sub in ("session-env", "file-history", "tasks", "todos", "shell-snapshots"):
             matches = [m for m in _glob.glob(os.path.join(root, sub, f"{real_id}*"))
@@ -1352,9 +1263,8 @@ def delete_claude_session_files(real_id: str, folder_rel: str):
                 except Exception as e:
                     logger.error(f"Failed to delete {match}: {e}")
 
-    # 3) prune leftover project dirs once their last transcript is gone, keeping
-    #    any memory/ with content. Folder-derived dirs included, so an
-    #    already-emptied project dir is pruned too.
+    # Prune empty project directories, including folder-derived paths.
+    # Preserve nonempty memory directories.
     if folder_rel is not None:
         abs_folder = folder_rel if os.path.isabs(folder_rel) else abs_folder_path(folder_rel)
         proj_dirs.update(d for d in claude_project_dirs(abs_folder) if os.path.isdir(d))
@@ -1378,9 +1288,8 @@ def delete_claude_session_files(real_id: str, folder_rel: str):
 
 
 def delete_codex_session_files(thread_id: str) -> int:
-    """Remove every on-disk trace of a codex thread: rollout .jsonl, its
-    .artifacts/ dir, its history.jsonl entries, and clone-specific hook
-    snapshots. Returns the number of rollout files removed."""
+    """Remove codex rollouts, artifacts, history entries, and clone hook snapshots.
+    Return the number of rollout files removed."""
     removed = 0
     if not is_safe_id(thread_id):
         return 0
@@ -1422,14 +1331,277 @@ def delete_codex_session_files(thread_id: str) -> int:
     return removed
 
 
-def parse_codex_rollout(path: str) -> Optional[dict]:
+class RolloutError(ValueError):
+    pass
+
+
+def codex_rollout_index(base_home: str) -> dict:
+    """Logical heads and physical segments in one configured session store."""
+    root = os.path.realpath(os.path.join(base_home, "sessions"))
+    groups, physical = {}, {}
+    for directory, _dirs, files in os.walk(root):
+        for filename in files:
+            match = re.fullmatch(r"rollout-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-(.+)\.jsonl", filename)
+            if not match:
+                continue
+            suffix = match[1]
+            logical_hint, _, continuation = suffix.partition("_")
+            path = os.path.join(directory, filename)
+            head = {"id": logical_hint}
+            error = None
+            try:
+                if os.path.commonpath([root, os.path.realpath(path)]) != root:
+                    raise RolloutError("rollout escapes its session store")
+                with open(path, "rb") as f:
+                    first = next((line for line in f if line.strip()), b"")
+                entry = json.loads(first)
+                if entry.get("type") != "session_meta":
+                    raise RolloutError("missing session metadata")
+                head = entry["payload"]
+                if not isinstance(head, dict):
+                    head = {"id": logical_hint}
+                    raise RolloutError("invalid session metadata")
+                if not is_safe_id(head.get("id")):
+                    raise RolloutError("invalid logical session id")
+                if head.get("history_base") is not None and not isinstance(head["history_base"], dict):
+                    raise RolloutError("invalid history ancestry metadata")
+                if (head.get("history_mode") == "paginated"
+                        and head.get("history_format") not in (None, "canonical_v1")):
+                    raise RolloutError("unsupported paginated history format")
+                if head.get("history_base") is not None and head.get("history_format") != "canonical_v1":
+                    raise RolloutError("unsupported history ancestry format")
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+                error = str(e)
+            logical = head.get("id")
+            if not is_safe_id(logical):
+                continue
+            physical_id = continuation or logical
+            info = {"path": path, "head": head, "physical_id": physical_id,
+                    "error": error}
+            groups.setdefault(logical, []).append(info)
+            physical.setdefault(physical_id, []).append(info)
+
+    indexed_paths = {}
+    for state in sorted(Path(base_home).glob("state_*.sqlite"), reverse=True):
+        try:
+            conn = sqlite3.connect(state.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)
+            try:
+                conn.execute("PRAGMA query_only=ON")
+                indexed_paths.update(conn.execute("SELECT id, rollout_path FROM threads"))
+            finally:
+                conn.close()
+            break
+        except sqlite3.Error:
+            continue
+
+    heads = {}
+    for logical, candidates in groups.items():
+        parents = {(i["head"].get("history_base") or {}).get("thread_id")
+                   for i in candidates if not i["error"]}
+        tips = [i for i in candidates if i["physical_id"] not in parents] or candidates
+        preferred = os.path.realpath(indexed_paths.get(logical) or "")
+        chosen = next((i for i in tips if not i["error"]
+                       and os.path.realpath(i["path"]) == preferred), None)
+        def rank(info):
+            try:
+                mtime = os.path.getmtime(info["path"])
+            except OSError:
+                mtime = 0
+            return os.path.basename(info["path"])[:26], mtime, info["path"]
+        heads[logical] = chosen or max(tips, key=rank)
+    return {"root": root, "heads": heads, "physical": physical}
+
+
+def codex_history_records(path: str, index: dict) -> List[dict]:
+    """Canonical JSONL records with immediate-parent byte and cumulative ordinal bounds."""
+    visiting = set()
+
+    def read_segment(info, byte_limit=None, ordinal_limit=None):
+        segment = info["path"]
+        if segment in visiting or len(visiting) >= 128:
+            raise RolloutError("cyclic or excessive rollout ancestry")
+        if info["error"]:
+            raise RolloutError(info["error"])
+        visiting.add(segment)
+        try:
+            inherited = []
+            base = info["head"].get("history_base")
+            if base:
+                parent_id = base.get("thread_id")
+                candidates = index["physical"].get(parent_id, [])
+                if len(candidates) != 1:
+                    raise RolloutError("missing or ambiguous rollout ancestor")
+                end_byte, end_ordinal = base.get("end_byte_offset"), base.get("end_ordinal_exclusive")
+                if (type(end_byte) is not int or type(end_ordinal) is not int
+                        or end_byte < 0 or end_ordinal < 0):
+                    raise RolloutError("invalid rollout ancestry bounds")
+                inherited = read_segment(candidates[0], end_byte, end_ordinal)
+            if os.path.commonpath([index["root"], os.path.realpath(segment)]) != index["root"]:
+                raise RolloutError("rollout escapes its session store")
+            with open(segment, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
+                if byte_limit is not None and byte_limit > size:
+                    raise RolloutError("rollout ancestor is incomplete")
+                raw = f.read(size if byte_limit is None else byte_limit)
+            if byte_limit is not None and raw and not raw.endswith(b"\n"):
+                raise RolloutError("rollout byte bound is not a record boundary")
+            if byte_limit is None and raw and not raw.endswith(b"\n"):
+                raw = raw[:raw.rfind(b"\n") + 1]
+            lines = raw.splitlines()
+            if ordinal_limit is not None and len(inherited) + len(lines) != ordinal_limit:
+                raise RolloutError("rollout ordinal and byte bounds disagree")
+            records = []
+            for line in lines:
+                if not line.strip():
+                    records.append({})
+                    continue
+                try:
+                    record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise ValueError("record is not an object")
+                except (ValueError, UnicodeError) as e:
+                    raise RolloutError("invalid complete rollout record") from e
+                if record.get("type") == "history_mutation":
+                    mutation = record.get("payload") or {}
+                    if mutation.get("version") != 1 or mutation.get("operation") != "append":
+                        raise RolloutError("unsupported canonical history mutation")
+                records.append(record)
+            return inherited + records
+        finally:
+            visiting.remove(segment)
+
+    info = next((i for candidates in index["physical"].values() for i in candidates
+                 if i["path"] == path), None)
+    if info is None:
+        raise RolloutError("rollout is absent from its store index")
+    return read_segment(info)
+
+
+def parse_canonical_codex(path: str, index: dict) -> dict:
+    """Visible canonical completions and tool events, grouped by stable turn identity."""
+    records = codex_history_records(path, index)
+    groups, seen, call_paths = {}, set(), {}
+    logical = cwd = model = effort = current = None
+    created = None
+
+    def group(turn_id, timestamp):
+        if not turn_id:
+            raise RolloutError("canonical item has no turn identity")
+        return groups.setdefault(turn_id, {"user": [], "user_ts": timestamp,
+            "start": timestamp, "timestamp": timestamp, "steps": [],
+            "summary": None, "final": None, "attachments": []})
+
+    def item_completed(item, turn_id, started, completed):
+        identity = (turn_id, item.get("type"), item.get("id"))
+        if not item.get("id"):
+            raise RolloutError("canonical completion has no item identity")
+        if identity in seen:
+            return
+        seen.add(identity)
+        norm = codex_history_item(item)
+        g = group(turn_id, started)
+        g["timestamp"] = max(g["timestamp"], completed)
+        if norm.get("item_type") == "user_message":
+            if norm.get("text"):
+                g["user"].append(norm["text"])
+                g["user_ts"] = min(g["user_ts"], started)
+        else:
+            g["steps"].extend(codex_item_to_steps(norm, completed))
+            if norm.get("item_type") == "agent_message":
+                text = strip_agent_markup(norm.get("text") or "")
+                if text:
+                    g["summary"] = text
+                    if item.get("phase") == "final_answer":
+                        g["final"] = text
+
+    for record in records:
+        payload = record.get("payload") or {}
+        kind = record.get("type")
+        if kind == "session_meta":
+            logical = payload.get("id") or logical
+            cwd = payload.get("cwd") or cwd
+            created = created or _iso_to_ms(payload.get("timestamp"))
+            continue
+        ts = _iso_to_ms(record.get("timestamp") or created)
+        if kind == "turn_context":
+            current = payload.get("turn_id") or current
+            model = payload.get("model") or model
+            effort = payload.get("effort") or effort
+            cwd = payload.get("cwd") or cwd
+        elif kind == "history_mutation":
+            current = payload.get("turn_id") or current
+            for completion in payload.get("display_completions") or []:
+                item_completed(completion.get("item") or {}, completion.get("turn_id") or current,
+                               completion.get("started_at_ms") or ts,
+                               completion.get("completed_at_ms") or ts)
+        elif kind == "event_msg":
+            event = payload.get("type")
+            current = payload.get("turn_id") or current
+            if event == "item_completed":
+                item_completed(payload.get("item") or {}, current,
+                               payload.get("started_at_ms") or ts,
+                               payload.get("completed_at_ms") or ts)
+            elif event in ("task_complete", "turn_aborted") and current in groups:
+                g = groups[current]
+                g["timestamp"] = max(g["timestamp"], ts)
+                if payload.get("last_agent_message") and not g["final"]:
+                    g["final"] = strip_agent_markup(payload["last_agent_message"])
+        elif kind == "response_item" and payload.get("type") == "function_call":
+            try:
+                args = json.loads(payload.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                args = {}
+            if payload.get("call_id"):
+                call_paths[payload["call_id"]] = args.get("file_path") or args.get("path")
+        elif kind == "response_item" and payload.get("type") == "function_call_output":
+            output = payload.get("output")
+            if isinstance(output, list) and current:
+                for block in output:
+                    if isinstance(block, dict) and block.get("type") == "input_image":
+                        att = data_url_to_attachment(block.get("image_url") or "",
+                            call_paths.get(payload.get("call_id")))
+                        if att:
+                            group(current, ts)["attachments"].append(att)
+    turns = []
+    for turn_id, g in groups.items():
+        if g["user"]:
+            turns.append({"sender": "me", "timestamp": g["user_ts"], "start": g["user_ts"],
+                          "summary": "\n".join(g["user"]), "steps": [], "turn_id": turn_id})
+        if g["steps"] or g["final"] or g["attachments"]:
+            turns.append({"sender": "claude", "timestamp": g["timestamp"], "start": g["start"],
+                          "summary": g["final"] or g["summary"] or "(no output)",
+                          "steps": g["steps"], "attachments": g["attachments"], "turn_id": turn_id})
+    return {"id": logical, "cwd": cwd, "model": model, "effort": effort,
+            "prompt": next((t["summary"] for t in turns if t["sender"] == "me"), None),
+            "summary": next((t["summary"] for t in reversed(turns) if t["sender"] == "claude"), "(no output)"),
+            "steps": [s for t in turns for s in t["steps"]], "created_at": created,
+            "turns": turns, "canonical": True,
+            "legacy_paths": [i["path"] for candidates in index["physical"].values()
+                             for i in candidates if not i["error"] and i["head"].get("id") == logical]}
+
+
+def parse_codex_rollout(path: str, index: Optional[dict] = None) -> Optional[dict]:
     """Parse a codex rollout file into a normalized session record."""
+    path = os.path.realpath(path)
+    if index is None:
+        store = next((p.parent for p in Path(path).parents if p.name == "sessions"), None)
+        if store is not None:
+            index = codex_rollout_index(str(store))
+    if index:
+        info = next((i for candidates in index["physical"].values() for i in candidates
+                     if i["path"] == path), None)
+        if info and info["head"].get("history_format") == "canonical_v1":
+            try:
+                return parse_canonical_codex(path, index)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+                logger.warning("Cannot read canonical rollout %s: %s", path, e)
+                return None
     thread_id = cwd = model = effort = None
     first_user = last_agent = None
     steps: List[dict] = []
     seen_msgs: Set[str] = set()  # agent text can appear as both event + item
     ts_ms = now_ms()
-    turns: List[dict] = []  # mirrors parse_claude_turns' structure
+    turns: List[dict] = []
     cur: Optional[dict] = None
     call_paths: Dict[str, str] = {}  # function call_id -> file path (Read of an image)
     seen_calls: Set[str] = set()  # shell runs already written as steps
@@ -1454,13 +1626,12 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
 
     def add_step(step: dict, entry_ts: int):
         if not str(step.get("content", "")).strip():
-            return  # never emit a bare dot on a blank log line
+            return  # Text-less media results contain a lone dot.
         steps.append(step)
         ensure_cur(entry_ts)["steps"].append(step)
 
     def first_time_call(key: str) -> bool:
-        """True the first time a run's identifier is seen. A record carrying no
-        identifier stands on its own."""
+        """True for a new run id; records without ids are independent."""
         if not key:
             return True
         if key in seen_calls:
@@ -1491,8 +1662,7 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
             add_step({"type": "message", "timestamp": entry_ts,
                       "content": _truncate(text)}, entry_ts)
 
-    # A prompt reaches the rollout as a loose event, as a history item, or both.
-    # The loose events are the record for a file that has them.
+    # Loose prompt events take precedence over duplicate history items.
     loose_prompts = False
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1527,7 +1697,7 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
                     ts_ms = _iso_to_ms(p.get("timestamp")) or ts_ms
                 elif dtype == "turn_context":
                     model = p.get("model") or model
-                    # codex records the reasoning effort per turn — keep the latest
+                    # Latest per-turn reasoning effort.
                     effort = p.get("effort") or effort
                     cwd = p.get("cwd") or cwd
                 elif dtype == "response_item" and p.get("type") == "message":
@@ -1538,7 +1708,6 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
                     if text and p.get("role") == "assistant":
                         add_agent_message(text, entry_ts)
                 elif dtype == "response_item" and p.get("type") == "function_call":
-                    # Remember each Read's file so an embedded image keeps its name.
                     try:
                         args = json.loads(p.get("arguments") or "{}")
                     except Exception:
@@ -1606,21 +1775,320 @@ def parse_codex_rollout(path: str) -> Optional[dict]:
     }
 
 
+def is_grok_session_id(value: Optional[str]) -> bool:
+    """Grok session ids are full UUIDs."""
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value.lower()
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+def grok_session_metadata(path: str) -> Optional[dict]:
+    """Read the identity and user-facing metadata of a session directory."""
+    try:
+        with open(os.path.join(path, "summary.json"), encoding="utf-8") as f:
+            summary = json.load(f)
+        info = summary.get("info") or {}
+        sid, cwd = info.get("id"), info.get("cwd")
+        if not is_grok_session_id(sid) or os.path.basename(path) != sid:
+            return None
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None
+        title = summary.get("generated_title")
+        return {"id": sid, "cwd": cwd,
+                "model": summary.get("current_model_id"),
+                "effort": summary.get("reasoning_effort"),
+                "num_messages": summary.get("num_messages") if isinstance(summary.get("num_messages"), int) else 0,
+                "subject": title.strip() if isinstance(title, str) and title.strip() else None,
+                "created_at": _iso_to_ms(summary.get("created_at")),
+                "updated_at": _iso_to_ms(summary.get("updated_at"))}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def grok_session_dirs(base_home: str, real_id: Optional[str] = None,
+                      include_unavailable: bool = False):
+    """Session directories below cwd groups; unreadable identities are discovery-only."""
+    if real_id is not None and not is_grok_session_id(real_id):
+        return
+    home = Path(base_home).expanduser().resolve()
+    root = home / "sessions"
+    if root.is_symlink() or not root.is_dir():
+        return
+    for group in sorted(root.iterdir()):
+        if group.is_symlink() or not group.is_dir():
+            continue
+        candidates = [group / real_id] if real_id else sorted(group.iterdir())
+        for path in candidates:
+            if path.is_symlink() or not path.is_dir() or not is_grok_session_id(path.name):
+                continue
+            if path.resolve().parent.parent != root:
+                continue
+            summary = path / "summary.json"
+            metadata = None if summary.is_symlink() else grok_session_metadata(str(path))
+            if metadata:
+                yield str(path), metadata
+            elif include_unavailable:
+                yield str(path), {"id": path.name, "unavailable": True}
+
+
+def find_grok_session(real_id: str, agent_cfg: dict) -> Optional[str]:
+    matches = [path for home in agent_home_dirs(agent_cfg)
+               for path, _ in grok_session_dirs(home, real_id)]
+    if len(matches) > 1:
+        raise ValueError("Grok session UUID has multiple directories in its store")
+    return matches[0] if matches else None
+
+
+def grok_output_text(value) -> str:
+    """Readable tool content, including tagged raw-output variants and bytes."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        if value and all(type(v) is int and 0 <= v <= 255 for v in value):
+            return bytes(value).decode("utf-8", errors="replace")
+        return "\n".join(filter(None, (grok_output_text(v) for v in value)))
+    if not isinstance(value, dict):
+        return ""
+    for key in ("text", "output_for_prompt", "tool_output_for_prompt", "content",
+                "raw_output", "output", "message", "summary"):
+        text = grok_output_text(value.get(key))
+        if text:
+            return text
+    if "stdout" in value or "stderr" in value:
+        return "\n".join(filter(None, (grok_output_text(value.get("stdout")),
+                                       grok_output_text(value.get("stderr")))))
+    for key, nested in value.items():
+        if isinstance(nested, dict) and key[:1].isupper():
+            text = grok_output_text(nested)
+            if text:
+                return text
+    return json.dumps(value, ensure_ascii=False) if value else ""
+
+
+def parse_grok_session(path: str, metadata: Optional[dict] = None) -> Optional[dict]:
+    """Normalize persisted ACP updates into prompt/reply turns and patched steps."""
+    rec = dict(metadata) if metadata else grok_session_metadata(path)
+    updates_path = os.path.join(path, "updates.jsonl")
+    if not rec or not os.path.exists(updates_path):
+        return None
+    if not os.path.isfile(updates_path) or os.path.islink(updates_path):
+        return {**rec, "path": path, "unavailable": True}
+    malformed = False
+    turns: List[dict] = []
+    prompt_turn = None
+    reply = None
+    tools = {}
+    seen_events = set()
+    chunk_step = None
+    chunk_text = ""
+
+    def close():
+        nonlocal prompt_turn, reply, tools, chunk_step, chunk_text
+        if reply and (reply["steps"] or reply["summary"]):
+            reply["summary"] = reply["summary"] or "(no output)"
+            turns.append(reply)
+        prompt_turn, reply, tools = None, None, {}
+        chunk_step, chunk_text = None, ""
+
+    try:
+        with open(updates_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except (ValueError, TypeError):
+                    if line.strip():
+                        malformed = True
+                    continue
+                if not isinstance(event, dict) or event.get("method") not in (
+                        "session/update", "_x.ai/session/update"):
+                    continue
+                params = event.get("params")
+                if not isinstance(params, dict) or params.get("sessionId") != rec["id"]:
+                    continue
+                update = params.get("update")
+                if not isinstance(update, dict):
+                    continue
+                meta = params.get("_meta") or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                event_id = meta.get("eventId")
+                if isinstance(event_id, str):
+                    if event_id in seen_events:
+                        continue
+                    seen_events.add(event_id)
+                stamp = meta.get("agentTimestampMs")
+                ts = int(stamp) if isinstance(stamp, (int, float)) else _iso_to_ms(event.get("timestamp"))
+                kind = update.get("sessionUpdate")
+                if kind == "turn_completed":
+                    if reply:
+                        reply["timestamp"] = max(reply["timestamp"], ts)
+                        reply["stop_reason"] = update.get("stop_reason")
+                    close()
+                    continue
+                if kind == "user_message_chunk":
+                    content = update.get("content") or {}
+                    if not isinstance(content, dict) or content.get("type") != "text":
+                        continue
+                    text = content.get("text")
+                    if not isinstance(text, str) or not text:
+                        continue
+                    if reply:
+                        close()
+                    if prompt_turn is None:
+                        prompt_turn = {"sender": "me", "timestamp": ts, "start": ts,
+                                       "summary": "", "steps": []}
+                        turns.append(prompt_turn)
+                    prompt_turn["summary"] += text
+                    continue
+                if kind not in ("agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"):
+                    continue
+                if prompt_turn is None:
+                    continue
+                if reply is None:
+                    reply = {"sender": "claude", "timestamp": ts, "start": ts,
+                             "summary": "", "steps": [], "attachments": []}
+                reply["timestamp"] = max(reply["timestamp"], ts)
+                if kind in ("agent_message_chunk", "agent_thought_chunk"):
+                    content = update.get("content") or {}
+                    if not isinstance(content, dict) or content.get("type") != "text":
+                        continue
+                    text = content.get("text")
+                    if not isinstance(text, str) or not text:
+                        continue
+                    step_type = "message" if kind == "agent_message_chunk" else "thought"
+                    if chunk_step is None or chunk_step["type"] != step_type:
+                        chunk_step = {"type": step_type, "timestamp": ts, "content": ""}
+                        reply["steps"].append(chunk_step)
+                        chunk_text = ""
+                    chunk_text += text
+                    chunk_step["content"] = _truncate(chunk_text)
+                    if step_type == "message":
+                        reply["summary"] = chunk_text.strip()
+                    continue
+                call_id = update.get("toolCallId")
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+                tool = tools.setdefault(call_id, {"data": {}, "call": None, "response": None})
+                data = tool["data"]
+                for key, value in update.items():
+                    if key in ("rawInput", "_meta") and isinstance(value, dict) and isinstance(data.get(key), dict):
+                        prior = data[key]
+                        data[key] = {**prior, **value}
+                        if key == "_meta" and isinstance(prior.get("x.ai/tool"), dict) and isinstance(value.get("x.ai/tool"), dict):
+                            data[key]["x.ai/tool"] = {**prior["x.ai/tool"], **value["x.ai/tool"]}
+                    else:
+                        data[key] = value
+                tool_meta = data.get("_meta") or {}
+                native = (tool_meta.get("x.ai/tool") or {}) if isinstance(tool_meta, dict) else {}
+                if not isinstance(native, dict):
+                    native = {}
+                name = native.get("name") or data.get("title") or "tool"
+                arg = data.get("rawInput", native.get("input", {}))
+                call_content = f"{name} {_truncate(json.dumps(arg, ensure_ascii=False), 1200)}"
+                if tool["call"] is None:
+                    tool["call"] = {"type": "call", "timestamp": ts, "content": call_content}
+                    reply["steps"].append(tool["call"])
+                    chunk_step, chunk_text = None, ""
+                else:
+                    tool["call"]["content"] = call_content
+                content = update.get("content")
+                blocks = [b.get("content") for b in content
+                          if isinstance(b, dict) and b.get("type") == "content"
+                          and isinstance(b.get("content"), dict)] if isinstance(content, list) else []
+                output = "\n".join(b["text"] for b in blocks
+                                   if b.get("type") == "text" and isinstance(b.get("text"), str))
+                output = output or grok_output_text(update.get("rawOutput"))
+                if output.strip():
+                    if tool["response"] is None:
+                        tool["response"] = {"type": "response", "timestamp": ts, "content": ""}
+                        reply["steps"].append(tool["response"])
+                        chunk_step, chunk_text = None, ""
+                    tool["response"].update(timestamp=ts, content=_truncate(output, 1200))
+    except OSError as e:
+        logger.warning("Cannot read Grok session %s: %s", rec["id"], e)
+        return {**rec, "path": path, "unavailable": True}
+    close()
+    if not turns:
+        return ({**rec, "path": path, "unavailable": True}
+                if malformed or rec.get("num_messages", 0) > 0 else None)
+    replies = [t for t in turns if t["sender"] == "claude"]
+    rec.update(turns=turns, prompt=turns[0]["summary"],
+               summary=replies[-1]["summary"] if replies else None,
+               steps=replies[-1]["steps"] if replies else [], path=path,
+               mtime=int(max(os.path.getmtime(updates_path),
+                             os.path.getmtime(os.path.join(path, "summary.json"))) * 1000))
+    rec["subject"] = rec["subject"] or subject_from_prompt(rec["prompt"])
+    return rec
+
+
+def discover_grok_transcripts():
+    """Yield (owner, normalized record, authoritative cwd) for scope filtering."""
+    for owner, base_home in agent_store_pairs("grok"):
+        for path, metadata in grok_session_dirs(base_home, include_unavailable=True):
+            rec = metadata if metadata.get("unavailable") else parse_grok_session(path, metadata)
+            if rec:
+                rec.update(path=path, agent_type="grok", agent_name=owner.get("name", "Grok"))
+                if rec.get("unavailable"):
+                    logger.warning("Grok session %s is present but unreadable", rec["id"])
+                yield owner, rec, metadata.get("cwd")
+
+
+def delete_grok_session_files(real_id: str, agent_cfg: dict) -> int:
+    """Remove validated session directories and exact search rows; shared history stays."""
+    if not is_grok_session_id(real_id):
+        return 0
+    removed = 0
+    for base_home in agent_home_dirs(agent_cfg):
+        for path, metadata in grok_session_dirs(base_home, real_id):
+            try:
+                shutil.rmtree(path)
+                removed += 1
+                index = Path(base_home).expanduser().resolve() / "sessions" / "session_search.sqlite"
+                if index.is_file() and not any(Path(str(index) + suffix).is_symlink()
+                                               for suffix in ("", "-wal", "-shm", "-journal")):
+                    conn = sqlite3.connect(index.as_uri() + "?mode=rw", uri=True)
+                    try:
+                        conn.execute("DELETE FROM session_docs WHERE session_id = ? AND cwd = ?",
+                                     (real_id, metadata["cwd"]))
+                        conn.commit()
+                    finally:
+                        conn.close()
+            except (OSError, sqlite3.Error) as e:
+                logger.warning("Cannot finish Grok session cleanup %s: %s", real_id, e)
+    return removed
+
+
+def delete_agent_session_files(real_id: str, app_id: str, folder: str,
+                               agent_name: Optional[str] = None,
+                               agent_cfg: Optional[dict] = None):
+    """Dispatch cleanup by exact configured owner; unconfigured legacy rows use legacy stores."""
+    owner = agent_cfg
+    if owner is None and agent_name:
+        owner = next((a for a in CONFIG.get("agents", [])
+                      if str(a.get("name", "")).lower() == str(agent_name).lower()), None)
+    agent_type = owner.get("type", "claude") if owner else None
+    if agent_type == "grok":
+        delete_grok_session_files(real_id, owner)
+        return
+    for ident in {i for i in (real_id, app_id) if i}:
+        if agent_type in (None, "claude"):
+            delete_claude_session_files(ident, folder)
+        if agent_type in (None, "codex"):
+            delete_codex_session_files(ident)
+
+
 def discover_transcripts() -> Dict[str, dict]:
-    """Scan every configured agent's transcript store -> {real_session_id:
-    record}. A cwd inside root_dir keeps the canonical scoped (relative) folder;
-    one outside keeps its full path if the owning agent is "global", else is
-    skipped.
+    """Scan agent stores into {real_session_id: record}.
+    Folders are root-relative inside root_dir; outside paths require global scope.
     record = {folder, path, mtime, subject, summary, steps, model, agent_name,
               agent_type, prompt, created_at}."""
     ws_root = root_dir()
     found: Dict[str, dict] = {}
 
     def folder_for_cwd(abs_cwd: Optional[str], agent_cfg: Optional[dict]) -> Optional[str]:
-        """Folder value for a transcript cwd. Inside root_dir the scoped
-        (relative) form is used regardless of agent scope — one path string per
-        directory. Outside: full path for a global agent, None (skip) for a
-        scoped one."""
+        """Use root-relative folders inside root_dir.
+        Outside paths stay absolute for global agents; scoped agents return None."""
         if not abs_cwd:
             return None
         real = os.path.realpath(abs_cwd)
@@ -1663,41 +2131,44 @@ def discover_transcripts() -> Dict[str, dict]:
                 }
 
     for owner, base_home in agent_store_pairs("codex"):
-        root = os.path.join(base_home, "sessions")
-        if not os.path.isdir(root):
-            continue
+        index = codex_rollout_index(base_home)
         thread_names = codex_thread_names(base_home)
-        for dirpath, _dirs, files in os.walk(root):
-            for fn in files:
-                if not (fn.startswith("rollout-") and fn.endswith(".jsonl")):
-                    continue
-                path = os.path.join(dirpath, fn)
-                # Cheap header peek first; only fully parse rollouts in scope.
-                # A subagent thread (a reviewer, a spawned worker) is the
-                # agent's own machinery and holds no conversation of the user's.
-                head_cwd, thread_source = codex_rollout_head(path)
-                if thread_source == "subagent" or folder_for_cwd(head_cwd, owner) is None:
-                    continue
-                rec = parse_codex_rollout(path)
-                if not rec or not is_safe_id(rec["id"]):
-                    continue
-                folder = folder_for_cwd(rec.get("cwd"), owner)
-                if folder is None:
-                    continue
-                found[rec["id"]] = {
-                    "folder": folder, "path": path,
-                    "mtime": int(os.path.getmtime(path) * 1000),
-                    # The name codex gave the thread, else its opening prompt.
-                    "subject": (thread_names.get(rec["id"])
-                                or (subject_from_prompt(rec["prompt"]) if rec.get("prompt")
-                                    else rec["id"])),
-                    "summary": rec.get("summary"), "steps": rec.get("steps"),
-                    "turns": rec.get("turns"),
-                    "model": rec.get("model"), "effort": rec.get("effort"),
-                    "agent_name": owner.get("name", "Codex"),
-                    "agent_type": "codex", "prompt": rec.get("prompt"),
-                    "created_at": rec.get("created_at"),
-                }
+        for sid, info in index["heads"].items():
+            head = info["head"]
+            if head.get("thread_source") == "subagent":
+                continue
+            if not info["error"] and folder_for_cwd(head.get("cwd"), owner) is None:
+                continue
+            path = info["path"]
+            if info["error"]:
+                logger.warning("Unreadable rollout %s: %s", path, info["error"])
+            rec = None if info["error"] else parse_codex_rollout(path, index)
+            if not rec:
+                found[sid] = {"unavailable": True}
+                continue
+            folder = folder_for_cwd(rec.get("cwd"), owner)
+            if folder is None:
+                continue
+            found[sid] = {
+                "folder": folder, "path": path,
+                "mtime": int(os.path.getmtime(path) * 1000),
+                "subject": (thread_names.get(sid)
+                            or (subject_from_prompt(rec["prompt"]) if rec.get("prompt") else sid)),
+                "summary": rec.get("summary"), "steps": rec.get("steps"),
+                "turns": rec.get("turns"), "canonical": rec.get("canonical", False),
+                "legacy_paths": rec.get("legacy_paths", []),
+                "model": rec.get("model"), "effort": rec.get("effort"),
+                "agent_name": owner.get("name", "Codex"), "agent_type": "codex",
+                "prompt": rec.get("prompt"), "created_at": rec.get("created_at"),
+            }
+    for owner, rec, cwd in discover_grok_transcripts():
+        if rec.get("unavailable"):
+            found[rec["id"]] = rec
+            continue
+        folder = folder_for_cwd(cwd, owner)
+        if folder is not None:
+            rec["folder"] = folder
+            found[rec["id"]] = rec
     return found
 
 
@@ -1713,13 +2184,100 @@ def advance_marks(cur, session_id: str, mtime: int, turn_ts: int) -> None:
         WHERE id = ?""", (mtime, turn_ts, session_id))
 
 
+def canonical_message_id(session_id: str, turn: dict) -> str:
+    """The imported message namespace identifies projection-owned rows."""
+    key = json.dumps([session_id, turn["turn_id"], turn["sender"]])
+    return "canon-" + str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+
+
+def sync_canonical_projection(cur, existing, rec: dict) -> Optional[int]:
+    """Synchronize derived turns while retaining unmatched local messages."""
+    sid = existing["id"]
+    rows = cur.execute("SELECT * FROM messages WHERE session_id = ?", (sid,)).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    legacy = [r for r in rows if not r["id"].startswith("canon-") and not r["carried"]]
+    adopted = set()
+    wanted = set()
+    fresh_reply = 0
+    turns = rec.get("turns") or []
+    for position, turn in enumerate(turns):
+        mid = canonical_message_id(sid, turn)
+        wanted.add(mid)
+        row = by_id.get(mid)
+        if row is None:
+            lower = (turns[position - 1]["timestamp"] if position else 0) if turn["sender"] == "me" else turn["start"] - 5000
+            upper = turn["timestamp"] + 5000
+            matches = [r for r in legacy if r["id"] not in adopted
+                       and r["sender"] == turn["sender"]
+                       and r["summary_output"] == turn["summary"]
+                       and lower <= r["timestamp"] <= upper]
+            if len(matches) == 1:
+                row = matches[0]
+                adopted.add(row["id"])
+                cur.execute("UPDATE messages SET id = ? WHERE id = ?", (mid, row["id"]))
+                cur.execute("UPDATE attachments SET message_id = ? WHERE message_id = ?",
+                            (mid, row["id"]))
+        values = (turn["timestamp"], turn["summary"], json.dumps(turn["steps"]))
+        changed = row is None or values != (row["timestamp"], row["summary_output"], row["expanded_thoughts"])
+        if row is None:
+            cur.execute("""INSERT INTO messages
+                (id, session_id, sender, timestamp, summary_output, expanded_thoughts)
+                VALUES (?, ?, ?, ?, ?, ?)""", (mid, sid, turn["sender"], *values))
+        elif changed:
+            cur.execute("""UPDATE messages SET timestamp = ?, summary_output = ?,
+                expanded_thoughts = ? WHERE id = ?""", (*values, mid))
+        if turn.get("attachments"):
+            signatures = {tuple(a) for a in cur.execute(
+                "SELECT name, media_type, size, src_path FROM attachments WHERE message_id = ?", (mid,))}
+            insert_attachments(cur, sid, mid, [a for a in dedup_attachments(turn["attachments"])
+                if (a["name"], a["media_type"], a["size"], a.get("path", "")) not in signatures])
+        if changed and turn["sender"] == "claude" and turn["timestamp"] > (existing["last_turn_ts"] or 0):
+            fresh_reply = max(fresh_reply, turn["timestamp"])
+    derived = set()
+    unmatched = [r for r in legacy if r["id"] not in adopted]
+    if unmatched:
+        for path in rec.get("legacy_paths", []):
+            projection = parse_codex_rollout(path, {})
+            for turn in (projection or {}).get("turns", []):
+                signature = json.dumps([turn["sender"], turn["timestamp"], turn["summary"],
+                                        turn["steps"]], sort_keys=True)
+                derived.add(signature)
+    obsolete = {mid for mid in by_id if mid.startswith("canon-") and mid not in wanted}
+    for row in unmatched:
+        try:
+            signature = json.dumps([row["sender"], row["timestamp"], row["summary_output"],
+                                    json.loads(row["expanded_thoughts"])], sort_keys=True)
+        except (TypeError, ValueError):
+            continue
+        if signature in derived:
+            obsolete.add(row["id"])
+    for mid in obsolete:
+        if mid not in wanted:
+            cur.execute("DELETE FROM attachments WHERE message_id = ?", (mid,))
+            cur.execute("DELETE FROM messages WHERE id = ?", (mid,))
+    newest = cur.execute("""SELECT timestamp, sender FROM messages WHERE session_id = ?
+        ORDER BY timestamp DESC, rowid DESC LIMIT 1""", (sid,)).fetchone()
+    turn_mark = max((t["timestamp"] for t in rec.get("turns") or []), default=0)
+    cur.execute("""UPDATE sessions SET transcript_mtime = ?, last_turn_ts = ?,
+        model = COALESCE(?, model), thinking_level = COALESCE(?, thinking_level)
+        WHERE id = ? AND (transcript_mtime != ? OR last_turn_ts != ?
+        OR COALESCE(model, '') != COALESCE(?, model, '')
+        OR COALESCE(thinking_level, '') != COALESCE(?, thinking_level, ''))""",
+        (rec["mtime"], turn_mark, rec.get("model"), rec.get("effort"), sid,
+         rec["mtime"], turn_mark, rec.get("model"), rec.get("effort")))
+    if newest:
+        cur.execute("""UPDATE sessions SET updated_at = ?, last_message_by = ? WHERE id = ?
+            AND (updated_at != ? OR last_message_by != ?)""",
+            (newest["timestamp"], newest["sender"], sid, newest["timestamp"], newest["sender"]))
+    if fresh_reply:
+        cur.execute("UPDATE sessions SET is_read = 0 WHERE id = ?", (sid,))
+    return fresh_reply or None
+
+
 def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
-    """Sync the DB with the agents' on-disk transcript stores: import sessions
-    created outside the app, refresh ones whose transcript changed externally,
-    prune imported ones whose transcript vanished. App-created sessions are
-    never pruned (a missing transcript degrades gracefully at resume).
-    Returns (session_id, reply_ts_ms) for sessions that gained a fresh agent
-    reply — the manual trigger notifies from it."""
+    """Import and refresh transcript-backed sessions; prune missing imported sessions.
+    App-created sessions survive missing transcripts. Return (session_id, reply_ts_ms)
+    for fresh agent replies, for notification by the manual trigger."""
     fresh_replies: List[Tuple[str, int]] = []
     if not force and (now_ms() - _LAST_RECONCILE["ts"]) < RECONCILE_THROTTLE_MS:
         return fresh_replies
@@ -1739,8 +2297,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
             " status, subject, subject_locked FROM sessions"
         ).fetchall()
 
-        # An app session re-imported as 'external' (reconcile beat the runner to the
-        # real id) loses to the authoritative app row.
+        # The app row owns its real id, including duplicates imported mid-run.
         app_real_ids = {r["claude_session_id"] for r in rows
                         if r["origin"] != "external" and r["claude_session_id"]}
         deduped = []
@@ -1759,17 +2316,30 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
             by_real[real] = r
 
         for real_id, rec in discovered.items():
+            if rec.get("unavailable"):
+                continue
             existing = by_real.get(real_id)
             if existing is not None and existing["status"] == "active":
-                # Never touch a session mid-run: the runner owns it and would
-                # duplicate its replies.
+                # The runner owns active sessions.
                 continue
-            # Claude may gain an aiTitle later — sync it unless the user renamed.
+            # Sync aiTitle unless the user renamed the session.
             if (existing is not None and existing["origin"] == "external"
                     and not existing["subject_locked"]
                     and rec["subject"] and rec["subject"] != existing["subject"]):
                 cur.execute("UPDATE sessions SET subject = ? WHERE id = ?",
                             (rec["subject"], existing["id"]))
+            if existing is not None and existing["origin"] == "external" and rec.get("canonical"):
+                reply_ts = sync_canonical_projection(cur, existing, rec)
+                if reply_ts:
+                    fresh_replies.append((existing["id"], reply_ts))
+                continue
+            if existing is not None and rec["agent_type"] == "grok":
+                cur.execute("""UPDATE sessions SET model = COALESCE(?, model),
+                    thinking_level = COALESCE(?, thinking_level) WHERE id = ?
+                    AND (model IS NOT COALESCE(?, model)
+                    OR thinking_level IS NOT COALESCE(?, thinking_level))""",
+                    (rec.get("model"), rec.get("effort"), existing["id"],
+                     rec.get("model"), rec.get("effort")))
             # Backfill the original prompt for reply-only imported threads.
             if (existing is not None and existing["origin"] == "external"
                     and rec.get("prompt")):
@@ -1786,8 +2356,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                         (str(uuid.uuid4()), existing["id"], first_ts - 1, rec["prompt"]))
                     logger.info(f"Backfilled original prompt for imported session {existing['id']}")
             if existing is None:
-                # A fresh transcript during a run IS that run — the runner links
-                # it, so importing now would duplicate it.
+                # The runner links transcripts created during its run.
                 if RUNNING_PROCESSES and now_ms() - rec["mtime"] < 120000:
                     continue
                 if rec["agent_type"] == "claude":
@@ -1811,7 +2380,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                       rec["agent_name"], rec["mtime"], last_ts))
                 if turns:
                     for t in turns:
-                        mid = str(uuid.uuid4())
+                        mid = canonical_message_id(real_id, t) if rec.get("canonical") else str(uuid.uuid4())
                         cur.execute("""INSERT INTO messages
                             (id, session_id, sender, timestamp, summary_output, expanded_thoughts)
                             VALUES (?, ?, ?, ?, ?, ?)""",
@@ -1838,8 +2407,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                 logger.info(f"Imported external session {real_id} ({rec['agent_name']}) "
                             f"in '{rec['folder']}' ({len(turns)} turns)")
             elif not existing["transcript_mtime"] and existing["origin"] != "external":
-                # First sighting of an app session's transcript: set both marks
-                # WITHOUT appending.
+                # First sighting of an app transcript sets both marks without appending.
                 if rec["agent_type"] == "claude":
                     turns, _tmodel = parse_claude_turns(rec["path"])
                 else:
@@ -1847,7 +2415,6 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                 advance_marks(cur, existing["id"], rec["mtime"],
                               max((t["timestamp"] for t in turns), default=0))
             elif rec["mtime"] > (existing["transcript_mtime"] or 0) and existing["status"] != "active":
-                # The file moved on: append the turns past the turn mark.
                 if rec["agent_type"] == "claude":
                     turns, _tmodel = parse_claude_turns(rec["path"])
                 else:
@@ -1855,7 +2422,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                 sid = existing["id"]
                 seen = existing["last_turn_ts"] or 0
                 new_turns = [t for t in turns if t["timestamp"] > seen]
-                # A merely-touched transcript must not produce a duplicate reply.
+                # An mtime-only change adds no reply.
                 last = cur.execute("""SELECT id, timestamp, summary_output FROM messages
                     WHERE session_id = ? AND sender = 'claude'
                     ORDER BY timestamp DESC LIMIT 1""", (sid,)).fetchone()
@@ -1866,9 +2433,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                 for t in new_turns:
                     if (t["sender"] == "claude" and last and not merged
                             and t["start"] <= last["timestamp"] <= t["timestamp"]):
-                        # A reply read while the agent was still working: the
-                        # stored row sits inside this turn, so it becomes the
-                        # finished one.
+                        # Complete the stored partial reply within this turn.
                         cur.execute("""UPDATE messages SET timestamp = ?,
                             summary_output = ?, expanded_thoughts = ? WHERE id = ?""",
                             (t["timestamp"], t["summary"], json.dumps(t["steps"]),
@@ -1881,7 +2446,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
                         last_sender = "claude"
                         got_reply = True
                         continue
-                    if (t["sender"] == "claude" and last
+                    if (rec["agent_type"] != "grok" and t["sender"] == "claude" and last
                             and last["summary_output"] == t["summary"]):
                         continue
                     mid = str(uuid.uuid4())
@@ -1916,6 +2481,8 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
 
         conn.commit()
     except Exception as e:
+        conn.rollback()
+        fresh_replies.clear()
         logger.error(f"reconcile_sessions error: {e}")
         traceback.print_exc()
     finally:
@@ -1924,7 +2491,7 @@ def reconcile_sessions(force: bool = False) -> List[Tuple[str, int]]:
 
 
 def unused_session_id(attempts: int = 20) -> str:
-    """A short app id no session holds: 32 bits collide eventually."""
+    """Allocate an unused app session id."""
     conn = get_db()
     try:
         for _ in range(attempts):
@@ -1933,20 +2500,18 @@ def unused_session_id(attempts: int = 20) -> str:
                 return sid
     finally:
         conn.close()
-    # 20 straight collisions is not chance — fall back to a full uuid.
+    # Use a full UUID after 20 collisions.
     return str(uuid.uuid4())
 
 
 def link_real_session_id(app_id: str, real_id: str):
-    """Record the CLI's real session id as soon as it is known, so reconcile
-    can't mistake the in-flight transcript for a new external session."""
+    """Link the real id immediately; reconciliation uses it to identify app-owned runs."""
     conn = get_db()
     try:
         conn.execute("UPDATE sessions SET claude_session_id = ? WHERE id = ?",
                      (real_id, app_id))
-        # An agent with no aiTitle is titled with its session id, but at create
-        # time only the app id exists. Now that the real one is known, show it —
-        # matching an imported thread's title. Skipped once the user renames.
+        # Use the real id as the default title for agents without aiTitle.
+        # Preserve user renames.
         conn.execute("""UPDATE sessions SET subject = ?
                         WHERE id = ? AND subject = ?
                           AND COALESCE(subject_locked, 0) = 0""",
@@ -1982,9 +2547,8 @@ def ingest_result_db(session_id: str, claude_session_id: Optional[str], folder: 
                      prompt: Optional[str], summary: str, steps: List[dict],
                      status: str = "completed", agent: Optional[str] = None,
                      attachments: Optional[List[dict]] = None) -> str:
-    """The runner's single write path for a finished turn: append the reply to a
-    session. The app-assigned session id never changes; the agent's real id is
-    stored separately as claude_session_id for --resume / transcript lookup."""
+    """Persist a finished turn. The app id stays fixed; claude_session_id holds
+    the CLI id for resume and transcript lookup."""
     conn = get_db()
     cursor = conn.cursor()
     ts = now_ms()
@@ -1992,7 +2556,7 @@ def ingest_result_db(session_id: str, claude_session_id: Optional[str], folder: 
         cursor.execute("SELECT id, status FROM sessions WHERE id = ?", (session_id,))
         row = cursor.fetchone()
         if row is None and session_id in DELETED_SESSIONS:
-            # Deleted after the turn started — a late result must not resurrect it.
+            # Late results must not recreate deleted sessions.
             return session_id
         if row is None:
             cursor.execute("""
@@ -2035,8 +2599,7 @@ def ingest_result_db(session_id: str, claude_session_id: Optional[str], folder: 
         """, (reply_id, session_id, "claude", ts, summary, json.dumps(steps)))
         insert_attachments(cursor, session_id, reply_id, attachments)
 
-        # The agent wrote its transcript before exiting; mark it as of now so
-        # reconcile does not read it as an external edit.
+        # Mark the runner-owned transcript as read for reconciliation.
         cursor.execute("""
         UPDATE sessions SET last_message_by = 'claude', updated_at = ?, status = ?,
                             is_read = 0
@@ -2051,9 +2614,7 @@ def ingest_result_db(session_id: str, claude_session_id: Optional[str], folder: 
 
 
 def safe_effort(effort: Optional[str]) -> Optional[str]:
-    """Effort is a short known vocabulary (minimal/low/…/max), so keeping only
-    lowercase letters stops a crafted value injecting into codex's
-    `-c model_reasoning_effort="…"` config string."""
+    """Restrict effort to lowercase letters for safe quoted codex config values."""
     if not effort:
         return None
     cleaned = re.sub(r"[^a-z]", "", str(effort).strip().lower())
@@ -2063,9 +2624,8 @@ def safe_effort(effort: Optional[str]) -> Optional[str]:
 def build_claude_command(agent_cfg: dict, prompt: str, resume_real_id: Optional[str],
                          fork: bool, model: Optional[str],
                          effort: Optional[str]) -> List[str]:
-    """Hard-coded: `-p`, the stream format the server must parse, and per-turn
-    values (model, effort, resume/fork). Everything else — the permission mode
-    included — comes from the agent's config `args`."""
+    """Build Claude args with fixed prompt/stream flags and per-turn settings.
+    Other flags, including permission mode, come from agent config."""
     claude_bin = agent_cfg.get("path") or "claude"
     cmd = [claude_bin, "-p", prompt, "--output-format", "stream-json", "--verbose"]
     if model and not is_placeholder(model):
@@ -2082,12 +2642,52 @@ def build_claude_command(agent_cfg: dict, prompt: str, resume_real_id: Optional[
     return cmd
 
 
+def build_grok_command(agent_cfg: dict, prompt: str, resume_id: Optional[str],
+                       fork: bool, model: Optional[str], effort: Optional[str],
+                       session_id: Optional[str] = None) -> List[str]:
+    """Headless Messages output with explicit UUID creation and native permissions."""
+    if resume_id and not is_grok_session_id(resume_id):
+        raise ValueError("Grok resume requires a real session UUID")
+    if fork and not resume_id:
+        raise ValueError("Grok fork requires an existing session UUID")
+    if (not resume_id or fork) and not is_grok_session_id(session_id):
+        raise ValueError("Grok new sessions require a real session UUID")
+    if resume_id and not fork and session_id:
+        raise ValueError("Grok --session-id is only valid for new or forked sessions")
+    cmd = [agent_cfg.get("path") or "grok", "-p", prompt,
+           "--output-format", "streaming-messages-json"]
+    if model and not is_placeholder(model):
+        cmd.extend(["--model", model])
+    if effort and not is_placeholder(effort):
+        if not isinstance(effort, str) or not re.fullmatch(r"[a-z]+", effort):
+            raise ValueError("Grok effort must be a lowercase effort name")
+        cmd.extend(["--effort", effort])
+    if resume_id:
+        cmd.extend(["--resume", resume_id])
+        if fork:
+            cmd.append("--fork-session")
+    if session_id:
+        cmd.extend(["--session-id", session_id])
+    cmd.extend(agent_cfg.get("args") or [])
+    return cmd
+
+
+def grok_result_error(event: dict) -> Optional[str]:
+    """Terminal errors carry the native error detail and stop reason."""
+    subtype = event.get("subtype") or ""
+    stop_reason = event.get("stop_reason") or ""
+    errors = event.get("errors") or []
+    if (event.get("is_error") or str(subtype).startswith("error") or errors
+            or stop_reason in ("error", "cancelled", "aborted")):
+        details = "; ".join(str(e) for e in errors) if isinstance(errors, list) else str(errors)
+        return details or str(event.get("result") or subtype or stop_reason or "Grok run failed")
+    return None
+
+
 def build_codex_command(agent_cfg: dict, prompt: str, resume_id: Optional[str],
                         model: Optional[str], effort: Optional[str]) -> List[str]:
-    """Hard-coded: `exec` (plus `resume <id>`), the JSON stream the server must
-    parse, the git-check skip (workspace dirs are rarely repos), and per-turn
-    model/effort. Everything else — the sandbox/approval bypass included —
-    comes from the agent's config `args`."""
+    """Build codex exec/resume args with JSON output, git-check skip, and per-turn settings.
+    Other flags, including sandbox/approval bypass, come from agent config."""
     bin_path = agent_cfg.get("path", "codex")
     cmd = [bin_path, "exec"]
     if resume_id:
@@ -2098,10 +2698,10 @@ def build_codex_command(agent_cfg: dict, prompt: str, resume_id: Optional[str],
     if effort and not is_placeholder(effort):
         eff = safe_effort(effort)
         if eff:
-            # eff is charset-restricted, so it can't break out of the quoted value.
+            # eff is restricted to lowercase letters.
             cmd.extend(["-c", f'model_reasoning_effort="{eff}"'])
     cmd.extend(agent_cfg.get("args") or [])
-    # "--" so a prompt starting with "-" can never be parsed as a CLI flag
+    # "--" protects leading hyphens in prompts.
     cmd.extend(["--", prompt])
     return cmd
 
@@ -2137,9 +2737,8 @@ def codex_item_to_steps(item: dict, ts_ms: int) -> List[dict]:
 
 
 def codex_thread_names(base_home: str) -> Dict[str, str]:
-    """Thread id -> the name codex gave it, from session_index.jsonl. The file is
-    append-only and a thread is renamed as it goes, so the last line for an id
-    carries its current name."""
+    """Read a codex thread name from append-only session_index.jsonl.
+    The last entry for an id holds its current name."""
     names: Dict[str, str] = {}
     try:
         with open(os.path.join(base_home, "session_index.jsonl"), "r", encoding="utf-8") as f:
@@ -2190,9 +2789,8 @@ def codex_history_item(item: dict) -> dict:
 
 
 def codex_call_key(value) -> str:
-    """Identity of one shell run in a rollout. A run is recorded twice, as a loose
-    event and as a history item, under one identifier; the call_ segment inside it
-    is shared by other runs, so the whole string names a single run."""
+    """Full shell-run identifier shared by its event and history item.
+    The call_ segment alone is shared across distinct runs."""
     return str(value or "").strip()
 
 
@@ -2207,9 +2805,8 @@ async def run_agent_command(session_id: str, prompt: str, folder_rel: str,
                             resume_id: Optional[str] = None, fork: bool = False,
                             model: Optional[str] = None, thinking: Optional[str] = None,
                             agent: Optional[str] = None):
-    """One agent turn, releasing the run slot however the turn ends. The slot is
-    claimed in create_session before this task is scheduled, so a double-submit
-    is rejected without a race."""
+    """Run one turn and always release its slot.
+    create_session claims the slot synchronously before scheduling the task."""
     try:
         await _run_agent_command(session_id, prompt, folder_rel, resume_id,
                                  fork, model, thinking, agent)
@@ -2221,9 +2818,7 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
                              resume_id: Optional[str] = None, fork: bool = False,
                              model: Optional[str] = None, thinking: Optional[str] = None,
                              agent: Optional[str] = None):
-    """Spawn the configured agent CLI (claude or codex) with JSON stream output;
-    the real session id and the step list come from the event stream itself, so
-    there is no jsonl guessing."""
+    """Spawn a configured CLI and ingest its streamed turn under the linked real id."""
     agent_cfg = get_agent(agent)
     abs_folder = resolve_session_folder(folder_rel, agent_cfg)
     if abs_folder is None:
@@ -2239,16 +2834,35 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
 
     resume_real_id = get_real_session_id(resume_id) if resume_id else None
     env = os.environ.copy()
-    # The CLI must write where discovery reads, so a configured home_dir reaches
-    # the process too, not just the scan.
+    # The CLI and discovery share the configured home_dir.
     home_override = str(agent_cfg.get("home_dir") or "").strip()
     if home_override:
-        env["CODEX_HOME" if agent_type == "codex" else "CLAUDE_CONFIG_DIR"] = \
-            os.path.expanduser(home_override)
-    if agent_type == "codex":
+        env_key = {"codex": "CODEX_HOME", "grok": "GROK_HOME"}.get(agent_type, "CLAUDE_CONFIG_DIR")
+        env[env_key] = os.path.expanduser(home_override)
+    grok_real_id = None
+    if agent_type == "grok":
+        try:
+            if resume_id and (not resume_real_id or not find_grok_session(resume_real_id, agent_cfg)):
+                raise ValueError("Grok resume session is missing from the configured store")
+            grok_real_id = str(uuid.uuid4()) if not resume_real_id or fork else resume_real_id
+            cmd = build_grok_command(agent_cfg, prompt, resume_real_id, fork, model, thinking,
+                                     grok_real_id if not resume_real_id or fork else None)
+            await asyncio.to_thread(link_real_session_id, session_id, grok_real_id)
+        except (ValueError, OSError) as e:
+            summary = f"Error running Grok: {e}"
+            await asyncio.to_thread(ingest_result_db, session_id, None, folder_rel, None,
+                                    model, thinking, None, summary, [], "completed", agent_name)
+            push_stream(session_id, summary + "\n")
+            push_stream(session_id, None)
+            STREAM_SUBSCRIBERS.pop(session_id, None)
+            await broadcast_event({"type": "session_completed", "session_id": session_id,
+                                   "folder": folder_rel, "agent": agent_name,
+                                   "output_preview": summary[:200]})
+            return
+    elif agent_type == "codex":
         cmd = build_codex_command(agent_cfg, prompt, resume_real_id, model, thinking)
     else:
-        # Never --resume an id whose transcript vanished — start fresh instead.
+        # Missing transcripts require a fresh run.
         if resume_real_id and find_session_jsonl(resume_real_id, folder_rel) is None:
             logger.warning(f"Resume transcript for {resume_real_id} not found "
                            f"(folder/file changed externally); starting a fresh session.")
@@ -2256,12 +2870,12 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
             fork = False
         cmd = build_claude_command(agent_cfg, prompt, resume_real_id, fork, model, thinking)
 
-    # cmd carries the prompt verbatim; conversation content stays out of
-    # stdout/service logs, so only what identifies the run is logged.
+    # Keep prompt text out of service logs.
     logger.info(f"Running {agent_name} ({cmd[0]}) in {abs_folder}: "
                 f"model={model or 'default'} effort={thinking or 'default'} "
                 f"resume={resume_real_id or '-'} prompt={len(prompt)} chars")
 
+    real_id: Optional[str] = grok_real_id
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -2270,14 +2884,15 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
             start_new_session=True,  # own process group so cancel can killpg
-            # One JSON event can embed a whole file, far past the 64KB default.
+            # JSON events can contain whole files, exceeding the default 64 KiB limit.
             limit=16 * 1024 * 1024,
         )
         RUNNING_PROCESSES[session_id] = process
 
-        real_id: Optional[str] = None
         real_model: Optional[str] = None
-        linked_real_id = False
+        linked_real_id = bool(grok_real_id)
+        terminal_seen = False
+        grok_errors: List[str] = []
         steps: List[dict] = []
         LIVE_STEPS[session_id] = steps  # live view for /sessions/{id}/live
         pushed_steps = 0  # count of steps already broadcast
@@ -2293,7 +2908,7 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
             try:
                 line = await process.stdout.readline()
             except (asyncio.LimitOverrunError, ValueError):
-                # Past even the raised limit: drain the buffer, don't abort the run.
+                # Drain oversized events while keeping the run alive.
                 line = await process.stdout.read(1024 * 1024)
             if not line:
                 break
@@ -2330,13 +2945,20 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
                         plain_lines.append(f"Error: {err}\n")
                         emit(f"✖ {err}\n")
             elif isinstance(evt, dict):
-                real_id = evt.get("session_id") or real_id
+                stream_id = evt.get("session_id")
+                if agent_type == "grok" and stream_id and stream_id != grok_real_id:
+                    raise ValueError("Grok stream session UUID does not match the linked run")
+                real_id = stream_id or real_id
                 etype = evt.get("type")
                 if etype == "system" and evt.get("subtype") == "init":
-                    real_model = evt.get("model") or real_model
+                    candidate_model = evt.get("model")
+                    if candidate_model and not (agent_type == "grok" and candidate_model == "unknown"):
+                        real_model = candidate_model
                 if etype in ("assistant", "user"):
                     msg = evt.get("message") or {}
-                    real_model = msg.get("model") or real_model
+                    candidate_model = msg.get("model")
+                    if candidate_model and not (agent_type == "grok" and candidate_model == "unknown"):
+                        real_model = candidate_model
                     if etype == "assistant":
                         note_tool_paths(msg.get("content"), tool_paths)
                         attachments.extend(sent_file_attachments(msg.get("content")))
@@ -2345,21 +2967,25 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
                     steps.extend(content_blocks_to_steps(msg.get("content"), now_ms()))
                 elif etype == "result":
                     result_text = evt.get("result") or result_text
-                for readable in stream_event_readable(evt):
-                    emit(readable)
+                    if agent_type == "grok":
+                        terminal_seen = True
+                        error = grok_result_error(evt)
+                        if error:
+                            grok_errors.append(error)
+                            emit(f"Error: {error}\n")
+                if not (agent_type == "grok" and etype == "result" and grok_result_error(evt)):
+                    for readable in stream_event_readable(evt):
+                        emit(readable)
             else:
                 plain_lines.append(raw)
                 emit(raw)
 
-            # Persist the real id at once, or reconcile imports the in-flight
-            # transcript as a duplicate.
+            # Link the real id immediately for reconciliation ownership.
             if real_id and not linked_real_id:
                 linked_real_id = True
                 await asyncio.to_thread(link_real_session_id, session_id, real_id)
 
-            # The run's new steps go to every client as they land; whoever has this
-            # session open renders them. "from" is the batch's index in the step
-            # list, so a client that missed one leaves the list to /sessions/{id}/live.
+            # "from" is the batch's step offset; gaps require a /live refresh.
             if len(steps) > pushed_steps:
                 await broadcast_event({
                     "type": "session_steps",
@@ -2374,20 +3000,26 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
         logger.info(f"Agent process finished with return code {process.returncode}")
 
         if session_id in DELETED_SESSIONS:
-            # Deleted mid-shutdown: ingesting would re-create the row — scrub the
-            # transcript the dying process re-wrote instead.
-            for ident in {i for i in (real_id, session_id) if i}:
-                delete_claude_session_files(ident, folder_rel)
-                delete_codex_session_files(ident)
+            # Deleted sessions discard late-written transcripts.
+            delete_agent_session_files(real_id, session_id, folder_rel, agent_cfg=agent_cfg)
             push_stream(session_id, None)
             STREAM_SUBSCRIBERS.pop(session_id, None)
             LIVE_STEPS.pop(session_id, None)
             return
 
         summary = result_text or "".join(plain_lines).strip() or "(no output)"
+        if agent_type == "grok":
+            if not terminal_seen:
+                grok_errors.append("Grok exited without a terminal result")
+            if process.returncode:
+                grok_errors.append(f"Grok exited with code {process.returncode}")
+            if grok_errors:
+                summary = "Error running Grok: " + "; ".join(grok_errors)
+                if plain_lines:
+                    summary += "\n" + "".join(plain_lines).strip()
+                emit(summary + "\n")
 
-        # codex states model/effort only in the rollout (Claude reports the model
-        # in its event stream, captured above); its images become attachments.
+        # Codex model, effort, and image attachments come from the rollout.
         if agent_type == "codex" and real_id:
             r_model, r_effort, r_atts = await asyncio.to_thread(codex_rollout_run_info, real_id)
             real_model = real_model or r_model
@@ -2397,7 +3029,14 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
                 attachments = r_atts
 
         discovered_title = None
-        if agent_type != "codex":
+        if agent_type == "grok" and real_id:
+            grok_path = await asyncio.to_thread(find_grok_session, real_id, agent_cfg)
+            metadata = grok_session_metadata(grok_path) if grok_path else None
+            if metadata:
+                discovered_title = metadata.get("subject")
+                real_model = metadata.get("model") or real_model
+                thinking = metadata.get("effort") or thinking
+        elif agent_type == "claude":
             jsonl_path = find_session_jsonl(real_id, folder_rel) if real_id else None
             if jsonl_path:
                 discovered_title = extract_ai_title(jsonl_path)
@@ -2428,9 +3067,8 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
         })
 
     except asyncio.CancelledError:
-        # CancelledError is a BaseException — the handler below does not cover it,
-        # and the agent runs detached with permissions bypassed. A cancelled task
-        # cannot count on its own awaits resuming, so the stop is shielded.
+        # CancelledError bypasses Exception handlers.
+        # Shield detached-agent cleanup from task cancellation.
         logger.warning(f"Run for session {session_id} cancelled — stopping the agent")
         try:
             await asyncio.shield(asyncio.create_task(stop_run(session_id)))
@@ -2438,14 +3076,17 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
             pass
         except Exception as e:
             logger.error(f"Could not stop agent for {session_id}: {e}")
+        if session_id in DELETED_SESSIONS:
+            delete_agent_session_files(real_id, session_id, folder_rel, agent_cfg=agent_cfg)
         raise
     except Exception as e:
         logger.error(f"Error executing agent: {e}")
         traceback.print_exc()
-        # An orphaned run keeps writing its transcript after the session is
-        # recorded finished, and reconcile appends the growing tail as duplicate
-        # replies. The result below records the outcome, so no interrupt mark.
+        # Stop the agent before recording its result; reconciliation may read its transcript.
         await stop_run(session_id, interrupted=False)
+        if session_id in DELETED_SESSIONS:
+            delete_agent_session_files(real_id, session_id, folder_rel, agent_cfg=agent_cfg)
+            return
         try:
             await asyncio.to_thread(
                 ingest_result_db,
@@ -2459,8 +3100,7 @@ async def _run_agent_command(session_id: str, prompt: str, folder_rel: str,
 async def broadcast_event(data: dict):
     payload = json.dumps(data)
     to_remove = set()
-    # Snapshot: connections churn while we await, and mutating a set mid-iteration
-    # raises RuntimeError.
+    # Snapshot connections across awaits; the set can change during sends.
     for ws in list(ACTIVE_CONNECTIONS):
         try:
             await ws.send_text(payload)
@@ -2486,16 +3126,14 @@ if HAS_FASTAPI:
     @asynccontextmanager
     async def lifespan(_app):
         yield
-        # Agents run detached (own process group) with permissions bypassed, so
-        # they outlive the server unless stopped here. Stopping precedes
-        # cancelling the runners, so each agent is reaped by a task that can
-        # still await; the runners then wind down with nothing left to kill.
+        # Reap detached agents before cancelling runner tasks.
+        # Cleanup awaits must complete before cancellation.
         for sid in list(RUNNING_PROCESSES):
             logger.warning(f"Server shutting down — stopping agent for {sid}")
             try:
                 await stop_run(sid)
             except Exception as e:
-                # One agent's failure must not stop the rest being cleaned up.
+                # Cleanup failures are isolated per agent.
                 logger.error(f"Failed to stop agent for {sid}: {e}")
         for task in list(RUNNER_TASKS):
             task.cancel()
@@ -2512,40 +3150,26 @@ if HAS_FASTAPI:
     )
 
     def require_auth(request: Request):
-        """Every request carries X-Timestamp + X-Auth: a one-time HMAC over
-        "ts:method:path:query:sha256(wire body)", time-window limited and
-        replay-rejected. The E2E middleware verifies it (it is the only layer
-        that sees the wire body) and records the verdict in the ASGI scope;
-        this dependency just enforces it. With X-Client-Key the signature is
-        checked against that client's ECDH keys (closed style — registered
-        clients, plus the server's own key for the local --notify trigger;
-        accepted in both modes). Without it the open scheme applies: the HMAC
-        key is derived from the server public key, accepted only on open
-        servers."""
+        """Require the authentication verdict set by E2EMiddleware in the ASGI scope."""
         if not HAS_CRYPTO or SERVER_PRIV is None:
             raise HTTPException(status_code=401, detail="Server has no keys (cryptography package missing)")
         if not request.scope.get("reinbox_authed"):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # E2E exemptions, each for a concrete reason:
-    #   /server/mode — the pre-auth probe: a client must read it to learn HOW to
-    #                  authenticate, so it cannot require the shared key.
-    #   /ws          — WebSocket frames are encrypted separately (WrappedSocket).
+    # /server/mode is the unauthenticated mode probe.
+    # /ws encrypts frames separately in WrappedSocket.
     E2E_EXEMPT = ("/server/mode", "/ws")
 
-    # Larger than a client could legitimately send — reject before buffering.
+    # Wire-body limit includes encryption and multipart overhead.
     MAX_WIRE_BODY = MAX_ARTIFACT_BYTES + 4 * 1024 * 1024
-    # A response is encrypted in one shot, so it is held in memory whole plus a
-    # ciphertext copy. Larger ones are refused — a sent-file reference can be
-    # hundreds of MB.
+    # One-shot encryption buffers plaintext and ciphertext in memory.
     MAX_ENCRYPTED_RESPONSE = MAX_ARTIFACT_BYTES
 
     class E2EMiddleware:
-        """Pure ASGI (so the swapped request body actually reaches the endpoint):
-        verify the request signature (which covers the wire body), decrypt
-        AES-GCM request bodies, encrypt every 2xx response — with the
-        per-client ECDH keys for closed-style requests, the public-key-derived
-        keys for open-style ones."""
+        """Verify timestamped, one-use HMACs over HTTP wire fields.
+        Decrypt AES-GCM request bodies and encrypt every 2xx response.
+        X-Client-Key selects registered-client ECDH in either mode; requests without
+        it use public-key-derived keys and require open mode."""
 
         def __init__(self, asgi_app):
             self.asgi_app = asgi_app
@@ -2561,12 +3185,10 @@ if HAS_FASTAPI:
                 await send({"type": "http.response.body",
                             "body": json.dumps({"detail": detail}).encode()})
 
-            # X-Client-Key ⇒ closed-style (per-client ECDH); without it, open-style,
-            # allowed only when the server IS open.
             client_pub = headers.get("x-client-key", "") or None
             if client_pub is None and not CONFIG.get("open_server", True):
                 return await self.asgi_app(scope, receive, send)  # will 401 in auth
-            # Strip the reverse-proxy mount prefix so exempt-path checks match.
+            # Exempt paths are relative to the reverse-proxy mount.
             root_path = scope.get("root_path", "") or ""
             path = scope.get("path", "")
             if root_path and path.startswith(root_path):
@@ -2591,13 +3213,10 @@ if HAS_FASTAPI:
                 if not msg.get("more_body"):
                     break
 
-            # Verified here — the only layer with the wire body — and recorded in the
-            # scope for require_auth. One-time per signature.
+            # Verify the wire body and store the one-use verdict for require_auth.
             ts = headers.get("x-timestamp", "")
             sig = headers.get("x-auth", "")
-            # raw_path/query_string are the bytes as transmitted, so the canonical
-            # string re-encodes to exactly what the client HMAC'd (a query can
-            # carry raw UTF-8, e.g. a rename subject).
+            # Sign transmitted path/query bytes, preserving raw UTF-8.
             raw_path = scope.get("raw_path")
             payload = http_sign_payload(
                 scope.get("method", ""),
@@ -2607,10 +3226,7 @@ if HAS_FASTAPI:
                   if client_pub else verify_open_signature(ts, sig, payload))
             authed = bool(ok and consume_signature(sig))
             scope["reinbox_authed"] = authed
-            # Authentication ends here, before any decryption, so a
-            # caller-supplied client key never reaches the ECDH. Only
-            # /server/mode and /ws skip auth, and both are exempt from this
-            # middleware.
+            # Reject unauthenticated requests before decryption.
             if not authed:
                 return await reject(401, "Unauthorized")
 
@@ -2619,7 +3235,7 @@ if HAS_FASTAPI:
                     body = decrypt_payload(client_pub, body)
                 except Exception:
                     return await reject(400, "Bad ciphertext")
-                # The wire body was octet-stream; X-Plain-Content-Type has the real type.
+                # X-Plain-Content-Type restores the decrypted body's content type.
                 plain_ct = headers.get("x-plain-content-type", "application/json")
                 scope = dict(scope)
                 scope["headers"] = [(k, v) for k, v in scope["headers"]
@@ -2639,20 +3255,17 @@ if HAS_FASTAPI:
                      "encrypt": False, "aborted": False}
 
             async def wrapped_send(message):
-                # The exchange is over once the 413 below is sent: later chunks
-                # from the app are dropped, not appended to what is on the wire.
+                # Drop all response chunks after sending 413.
                 if state["aborted"]:
                     return
                 if message["type"] == "http.response.start":
-                    # Every 2xx is encrypted, JSON and binary alike (X-Encrypted).
+                    # Encrypt all 2xx bodies, including binary responses.
                     ok = 200 <= message["status"] < 300
                     if ok:
                         declared = next((v for k, v in message.get("headers", [])
                                          if k.decode().lower() == "content-length"), None)
                         try:
-                            # One-shot GCM needs the whole body in memory, so a
-                            # declared oversize length is refused before the file
-                            # is read at all.
+                            # Reject declared oversize responses before reading the body.
                             if declared is not None and int(declared) > MAX_ENCRYPTED_RESPONSE:
                                 state["aborted"] = True
                                 return await reject(413, "Response too large to encrypt")
@@ -2665,7 +3278,7 @@ if HAS_FASTAPI:
                 elif message["type"] == "http.response.body" and state["encrypt"]:
                     chunk = message.get("body", b"")
                     state["size"] += len(chunk)
-                    # Streamed bodies may not declare a length — bound them here.
+                    # Bound streamed bodies with undeclared lengths.
                     if state["size"] > MAX_ENCRYPTED_RESPONSE:
                         state["aborted"] = True
                         state["chunks"] = []
@@ -2692,7 +3305,7 @@ if HAS_FASTAPI:
 
     @app.get("/server/mode")
     def get_server_mode():
-        """Unauthenticated probe so clients know how to authenticate."""
+        """Unauthenticated authentication-mode probe."""
         return {"open": bool(CONFIG.get("open_server", True))}
 
     @app.get("/server/info", dependencies=[Depends(require_auth)])
@@ -2786,8 +3399,7 @@ if HAS_FASTAPI:
     @app.get("/messages", dependencies=[Depends(require_auth)])
     def list_messages(sender: Optional[str] = None, limit: int = 300,
                       reconcile: int = 0):
-        """Flat list of messages across all sessions (Gmail-style Inbox/Sent),
-        newest first, each joined to its session's subject/folder."""
+        """List messages newest-first across sessions, with subject and folder."""
         if reconcile:
             reconcile_sessions()
         conn = get_db()
@@ -2832,9 +3444,8 @@ if HAS_FASTAPI:
     @app.get("/search", dependencies=[Depends(require_auth)])
     def search_messages(q: str = Query(...), sender: Optional[str] = None,
                         session_id: Optional[str] = None, limit: int = 200):
-        """Substring search over message bodies and session subjects, newest
-        first, same row shape as /messages. Scoped to one session when
-        session_id is given (then fork-carried turns are included too)."""
+        """Search bodies and subjects newest-first, using the /messages row shape.
+        A session_id limits the search and includes fork-carried turns."""
         term = (q or "").strip()
         if not term:
             return {"messages": []}
@@ -2866,8 +3477,7 @@ if HAS_FASTAPI:
         conn.close()
 
         def snippet(text: str) -> str:
-            """Window the body around the first match so the highlighted hit is
-            visible even deep inside a long reply."""
+            """Window the body around its first match."""
             flat = (text or "").strip().replace("\n", " ")
             idx = flat.lower().find(term.lower())
             if idx <= 60:
@@ -2992,8 +3602,7 @@ if HAS_FASTAPI:
 
     @app.get("/sessions/{session_id}/live", dependencies=[Depends(require_auth)])
     def get_live_steps(session_id: str):
-        """Streamed structured steps of a run in progress (both Claude's
-        stream-json and codex --json emit events as they complete)."""
+        """Stream structured steps from the active run."""
         check_session_id(session_id)
         return {
             "active": session_id in RUNNING_PROCESSES,
@@ -3012,9 +3621,7 @@ if HAS_FASTAPI:
         resume_id = data.get("resume_id")
         fork = bool(data.get("fork", False))
 
-        # Scoped folders must stay inside root_dir; absolute ones are allowed only
-        # for a global-scope agent (e.g. replying to a session imported from
-        # elsewhere on the machine).
+        # Relative folders stay inside root_dir; absolute folders require global scope.
         if resolve_session_folder(folder, agent_cfg) is None:
             raise HTTPException(status_code=403, detail="Folder escapes the workspace sandbox")
         if resume_id is not None and not is_safe_id(resume_id):
@@ -3030,24 +3637,19 @@ if HAS_FASTAPI:
             fork = False
 
         timestamp_ms = now_ms()
-        # Resuming is explicit. A fresh id carries only 32 bits, so a collision
-        # is regenerated: it must not land on the session already holding that id.
+        # Fresh ids must be unique; resume is explicit.
         resuming = bool(resume_id) and not fork
         if resuming:
             session_id = resume_id
         else:
             session_id = await asyncio.to_thread(unused_session_id)
 
-        # One agent per session: a reply while the previous turn still runs would
-        # race two processes over one transcript. The slot is claimed BEFORE the
-        # first await, so two simultaneous replies cannot both pass the check.
+        # Claim the per-session run slot before the first await.
         if session_id in ACTIVE_RUNS:
             raise HTTPException(status_code=409, detail="Session is still running")
         ACTIVE_RUNS.add(session_id)
 
-        # Claude's prompt-derived line is replaced by the aiTitle later; codex has
-        # no aiTitle, so its title is its session id — the app id as a placeholder
-        # here, swapped for the real one by link_real_session_id.
+        # Codex starts with a session-id title; other agents start with the prompt.
         if not subject or subject.strip() in ("", "Unnamed Session"):
             if agent_cfg.get("type") == "codex":
                 subject = session_id
@@ -3058,11 +3660,8 @@ if HAS_FASTAPI:
             conn = get_db()
             cursor = conn.cursor()
             cursor.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
-            # A resume whose row was pruned falls through and re-inserts it.
             if resuming and cursor.fetchone():
-                # Resume: keep history, created_at and subject. The per-turn effort
-                # becomes the session's latest at once, so the client's "previous
-                # effort" default is right mid-run.
+                # Resume preserves history, created_at, and subject; effort becomes the latest value.
                 cursor.execute("""
                 UPDATE sessions SET status = 'active', last_message_by = 'me', updated_at = ?,
                     thinking_level = ?
@@ -3071,8 +3670,7 @@ if HAS_FASTAPI:
                       thinking_level if (thinking_level and not is_placeholder(thinking_level)) else "default",
                       session_id))
             else:
-                # A fork (--fork-session) is a NEW session seeded with the source's
-                # history, so copy its messages to mirror the forked transcript.
+                # Forks inherit the source history.
                 if fork and resume_id:
                     src = cursor.execute(
                         "SELECT subject, folder, model, thinking_level, agent FROM sessions WHERE id = ?",
@@ -3090,8 +3688,7 @@ if HAS_FASTAPI:
                             "SELECT id, sender, timestamp, summary_output, expanded_thoughts "
                             "FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
                             (resume_id,)).fetchall():
-                            # carried=1: shown in the branch, hidden from the flat
-                            # lists so they don't duplicate the source thread.
+                            # Carried messages appear in the branch, not flat lists.
                             new_mid = str(uuid.uuid4())
                             cursor.execute("""INSERT INTO messages
                                 (id, session_id, sender, timestamp, summary_output,
@@ -3153,8 +3750,7 @@ if HAS_FASTAPI:
             thinking=thinking_level,
             agent=agent
         ))
-        # Retained (asyncio only holds a weak reference) and self-removing, so
-        # shutdown has the live set to cancel.
+        # Keep strong task references for shutdown; asyncio holds only weak references.
         RUNNER_TASKS.add(task)
         task.add_done_callback(RUNNER_TASKS.discard)
 
@@ -3162,12 +3758,8 @@ if HAS_FASTAPI:
 
     @app.post("/reconcile", dependencies=[Depends(require_auth)])
     async def trigger_reconcile(push: str = Query("latest")):
-        """Manual reconcile trigger (`reinbox_server.py --notify`): import and
-        refresh terminal sessions NOW, then push a notification for the
-        latest fresh agent reply only. One deliberate signal when the user
-        decides a session is worth announcing — never a per-turn nag while
-        they are still working interactively (passive imports via
-        ?reconcile=1 stay silent). push=none skips the notification."""
+        """Reconcile terminal sessions and notify for the latest fresh agent reply.
+        push=none and passive ?reconcile=1 imports are silent."""
         fresh = await asyncio.to_thread(reconcile_sessions, True)
         notified = None
         if push == "latest" and fresh:
@@ -3191,7 +3783,7 @@ if HAS_FASTAPI:
                     "session_id": sid,
                     "folder": srow["folder"],
                     "subject": srow["subject"] or "No Title",
-                    # FULL final response, so the notification shows it whole.
+                    # Untruncated final response for the notification.
                     "output_preview": (mrow["summary_output"] if mrow else ""),
                     "agent": srow["agent"],
                     "model": srow["model"],
@@ -3206,8 +3798,7 @@ if HAS_FASTAPI:
         if session_id not in RUNNING_PROCESSES:
             raise HTTPException(status_code=404, detail="No running process for this session")
 
-        # Returns once the agent is gone, so a client that cancels then resumes
-        # cannot race a still-dying process onto the same transcript.
+        # Cancellation waits for process exit; subsequent resumes share its transcript.
         await stop_run(session_id)
         logger.info(f"Cancelled session {session_id}")
         return {"status": "cancelled", "session_id": session_id}
@@ -3215,11 +3806,9 @@ if HAS_FASTAPI:
     @app.delete("/sessions/{session_id}", dependencies=[Depends(require_auth)])
     async def delete_session(session_id: str):
         check_session_id(session_id)
-        # Wait for the agent to be gone before removing its files: a live process
-        # writes its transcript back as fast as it is deleted.
+        # Stop the agent before deleting files it can rewrite.
         await stop_run(session_id, interrupted=False)
-        # Tombstone so a runner winding down (or a late ingest) can't re-create the
-        # session; old ones age out.
+        # Tombstones block late runner/ingest writes and expire over time.
         now = time.time()
         for k, t in list(DELETED_SESSIONS.items()):
             if now - t > 86400:
@@ -3229,17 +3818,14 @@ if HAS_FASTAPI:
         def db_work():
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute("SELECT folder, claude_session_id FROM sessions WHERE id = ?",
+            cursor.execute("SELECT folder, claude_session_id, agent FROM sessions WHERE id = ?",
                            (session_id,))
             row = cursor.fetchone()
 
-            # Only ids this server owns reach the filesystem. Without a row there
-            # is nothing to clean: an app id is not a transcript name.
+            # Filesystem cleanup requires a server-owned row; app ids are not transcript names.
             if row is not None:
                 real = row["claude_session_id"] or session_id
-                for ident in {real, session_id}:
-                    delete_claude_session_files(ident, row["folder"])
-                    delete_codex_session_files(ident)
+                delete_agent_session_files(real, session_id, row["folder"], row["agent"])
 
             cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             conn.commit()
@@ -3275,18 +3861,12 @@ if HAS_FASTAPI:
         return {"status": "renamed", "session_id": session_id, "subject": subject}
 
     def safe_artifact_path(folder: str, filename: str) -> str:
-        """Sandboxed absolute path for a single artifact file. resolve_session_folder
-        returns a fully realpath-resolved directory (no symlink components), and
-        the filename may not contain path parts, so the only way to escape is a
-        symlink AT the final component. That is not checked here — a pre-check is
-        TOCTOU-racy (the link can be swapped between check and open); instead the
-        read/write opens pass O_NOFOLLOW and delete uses a no-follow lstat, so the
-        symlink is refused atomically at the syscall itself."""
+        """Join a resolved session directory and a single filename.
+        Callers reject final-component symlinks with O_NOFOLLOW or lstat;
+        path validation alone cannot guard against link swaps."""
         target_dir = resolve_session_folder(folder)
         if target_dir is None:
             raise HTTPException(status_code=403, detail="Sandbox violation")
-        # A name carrying a separator is out by the basename test; "." and ".."
-        # are the two that remain and name a directory, not an artifact.
         if not filename or os.path.basename(filename) != filename or filename in (".", ".."):
             raise HTTPException(status_code=400, detail="Invalid filename")
         return os.path.join(target_dir, filename)
@@ -3329,8 +3909,7 @@ if HAS_FASTAPI:
                                 detail="File exceeds the 8 MB artifact limit")
 
         def write_no_follow():
-            # O_NOFOLLOW: a symlink at dest_path fails the open, rather than being
-            # written through to a target outside the folder.
+            # O_NOFOLLOW rejects final-component symlinks at open.
             fd = os.open(dest_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             with os.fdopen(fd, "wb") as f:
                 f.write(content)
@@ -3347,9 +3926,8 @@ if HAS_FASTAPI:
     @app.get("/artifacts/download", dependencies=[Depends(require_auth)])
     def download_artifact(folder: str, filename: str):
         target_file = safe_artifact_path(folder, filename)
-        # O_NOFOLLOW refuses a symlinked name atomically, so a link swapped in
-        # after the sandbox check can't exfiltrate; the bytes are read through
-        # this one fd rather than reopened by path.
+        # O_NOFOLLOW rejects final-component symlinks at open.
+        # Read through the same descriptor without reopening the path.
         try:
             fd = os.open(target_file, os.O_RDONLY | os.O_NOFOLLOW)
         except OSError as e:
@@ -3373,7 +3951,7 @@ if HAS_FASTAPI:
     @app.delete("/artifacts", dependencies=[Depends(require_auth)])
     def delete_artifact(folder: str = Query(...), filename: str = Query(...)):
         target_file = safe_artifact_path(folder, filename)
-        # lstat does not follow symlinks, so only a real regular file is deletable.
+        # lstat checks the named entry without following symlinks.
         try:
             st = os.lstat(target_file)
         except OSError:
@@ -3389,10 +3967,9 @@ if HAS_FASTAPI:
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket, client: Optional[str] = None,
                                  ts: Optional[str] = None, sig: Optional[str] = None):
-        """Upgrade auth mirrors HTTP: ?client=&ts=&sig= for closed style,
-        ?ts=&sig= (signature from the public-key-derived HMAC key) for open
-        style, each signature spent on one upgrade. Every frame in both
-        directions is AES-GCM encrypted as {"enc": "<b64 nonce+ciphertext>"}."""
+        """Authenticate one-use WebSocket upgrades via ?client=&ts=&sig= (ECDH)
+        or ?ts=&sig= (open-mode HMAC). Frames in both directions use AES-GCM
+        with {"enc": "<b64 nonce+ciphertext>"}."""
         if not HAS_CRYPTO or SERVER_PRIV is None:
             await websocket.close(code=4001, reason="Server has no keys")
             return
@@ -3455,7 +4032,7 @@ if HAS_FASTAPI:
     async def stream_logs_task(ws, session_id: str):
         subs = STREAM_SUBSCRIBERS.get(session_id)
         if subs is None:
-            return  # not running (anymore); nothing to stream
+            return  # No active stream.
         queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         subs.add(queue)
         try:
@@ -3481,9 +4058,7 @@ else:
 
 
 def _qr_terminal(key: str) -> Optional[str]:
-    """Scannable terminal QR: modules as solid ANSI background cells, not
-    foreground glyphs (those get broken up by font antialiasing/line spacing so
-    cameras can't decode them). None if pyqrcode is missing."""
+    """Render QR modules as solid ANSI background cells; return None without pyqrcode."""
     try:
         import pyqrcode
     except Exception:
@@ -3519,10 +4094,8 @@ def print_qr_key(key: str, label: str = "SERVER PUBLIC KEY"):
 
 
 def notify_running_server(config_path: str) -> int:
-    """`reinbox_server.py --notify [config.json]`: tell the RUNNING server to
-    reconcile now and push a notification for the latest fresh agent reply.
-    Run it after finishing an interactive CLI session (or from cron, after a
-    plain agent command) — it authenticates with the server's own key file."""
+    """Ask the running server to reconcile and notify for the latest fresh reply.
+    Authenticate with the server's private key file."""
     load_config(config_path)
     kpath = key_file_path()
     try:
@@ -3550,7 +4123,6 @@ def notify_running_server(config_path: str) -> int:
     ts = str(now_ms())
     payload = http_sign_payload("POST", path, "push=latest", b"")
     sig = hmac.new(auth_key, f"{ts}:{payload}".encode(), hashlib.sha256).hexdigest()
-    # Target an address this config's server actually listens on.
     binds = CONFIG.get("bind") or []
     if isinstance(binds, str):
         binds = [binds] if binds else []
@@ -3575,12 +4147,8 @@ def notify_running_server(config_path: str) -> int:
 
 
 def warn_if_bypass_exposed(binds: List[str]):
-    """A loud reminder when permission-bypass agents are reachable off the local
-    machine. The async design needs those flags (nobody is present to approve a
-    prompt), so any authorized request runs code as the server user — on a
-    non-loopback interface that is effectively remote code execution to anyone
-    holding the key. Not an error (it is the documented model), just a warning
-    so it is a deliberate choice."""
+    """Warn when permission-bypass agents listen beyond loopback.
+    Authorized requests can execute code as the server user without approval."""
     BYPASS = ("bypasspermissions", "--dangerously-bypass-approvals-and-sandbox",
               "--dangerously-skip-permissions")
     bypass_agents = [a.get("name", "?") for a in (CONFIG.get("agents") or [])
@@ -3597,9 +4165,6 @@ def warn_if_bypass_exposed(binds: List[str]):
 
 
 def main():
-    # Optional config path argument so several servers can run side by side:
-    #   python3 reinbox_server.py [config.json]
-    #   python3 reinbox_server.py --notify [config.json]   -> trigger a running server
     argv = [a for a in sys.argv[1:] if a != "--notify"]
     config_path = argv[0] if argv else "config.json"
     if "--notify" in sys.argv:
@@ -3619,14 +4184,13 @@ def main():
 
     if HAS_FASTAPI:
         port = CONFIG.get("port", OPTIONAL_CONFIG["port"])
-        # The proxy forwards the prefix unchanged, so mount the whole app under it.
+        # The reverse proxy preserves the configured path prefix.
         base_path = str(CONFIG.get("base_path", "") or "").strip().rstrip("/")
         if base_path and not base_path.startswith("/"):
             base_path = "/" + base_path
         to_serve = app
         if base_path:
-            # A mount does not run the child's lifespan, so the parent carries it
-            # — otherwise nothing stops the agents when serving under a prefix.
+            # The parent owns shutdown cleanup; mounted apps do not run their lifespan.
             parent = FastAPI(lifespan=lifespan)
             parent.mount(base_path, app)
             to_serve = parent
@@ -3642,9 +4206,8 @@ def main():
         if len(binds) == 1:
             uvicorn.run(to_serve, host=binds[0], port=port)
         else:
-            # One uvicorn server per address in one event loop. Signal handlers are
-            # per-process singletons, so only bare servers here; Ctrl+C lands as
-            # KeyboardInterrupt and stops the loop whole.
+            # One server per address shares the event loop.
+            # Disable per-server signal handlers; KeyboardInterrupt stops the loop.
             class _BareServer(uvicorn.Server):
                 def install_signal_handlers(self):
                     pass

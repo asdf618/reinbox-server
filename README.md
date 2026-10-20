@@ -1,117 +1,130 @@
 # Reinbox Server
 
-The backend of **Reinbox**, an email-like orchestrator for CLI coding agents.
-The client provides the interface; this half runs on the machine where the
-agents live — it launches the runs (`claude -p` / `codex exec`), stores the
-conversations, and pushes completion events. Sessions started directly in a
-terminal are imported as well, and an agent set to **global scope** contributes
-every session on the machine, whatever directory it ran in.
+Run coding agents on your computer and manage their conversations from the
+Reinbox Android app. Reinbox presents sessions as an inbox: start a task, read
+streamed replies and tool output, send a follow-up, or pick up a conversation
+started in your terminal.
 
-## Requirements
+The server supports **Claude Code, Codex, and Grok CLI**. It runs alongside your
+installed agents and stores conversations in SQLite.
 
-- Python 3.10+
-- Claude Code and/or Codex, installed and authenticated on the same machine
-- `pip install -r requirements.txt` (`pyqrcode` is optional — terminal QR)
+## Get started
 
-## Setup
+You need Python 3.10+, the Reinbox app, and at least one supported CLI installed
+and authenticated on the server machine. Check that the CLI works in your
+terminal first.
+
+### 1. Install
 
 ```bash
-cp config.json.example config.json   # then edit — see below
-python3 reinbox_server.py            # or: python3 reinbox_server.py other-config.json
+git clone https://github.com/asdf618/reinbox-server.git
+cd reinbox-server
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
+cp config.json.example config.json
 ```
 
-First run generates an X25519 keypair: the private key is written to
-`config.key` (mode 600) next to the config, and the public key is printed as
-text and as a scannable terminal QR. That key is what the app scans to add this
-server.
+### 2. Configure
 
-Several servers can run side by side with different config files and ports.
+Edit `config.json` using the [example configuration](config.json.example):
 
-## config.json
+- Set `root_dir` to your projects directory and `db_path` to a writable location
+  for the database. Use absolute paths.
+- Keep the agents you have installed. Set each agent's `path` to its executable
+  and give it a unique `name`.
+- Choose how the app will reach the server. `bind: ["127.0.0.1"]` works with a
+  local tunnel; `bind: []` listens on all IPv4 interfaces. The default port is
+  `16861`.
+- Review `open_server` and each agent's `args` before starting.
 
-Read once, at startup — edit it, then restart. A missing or invalid config stops
-the server.
+**The example enables permission bypass for Claude Code and Codex.** Anyone
+with server access can run those agents as your OS user. Use a trusted network
+or tunnel and read [Access and permissions](#access-and-permissions) below.
 
-### Required
+### 3. Start and connect
 
-| Key | Meaning |
-|---|---|
-| `root_dir` | Scoped sessions run in subdirectories of this root and their paths are shown relative to it. A leading `/` marks a full path, used by global-scope agents (their root is effectively `/`). |
-| `db_path` | SQLite file for sessions/messages. It runs in WAL mode, so a copy taken while the server runs also needs the `-wal` and `-shm` files beside it. |
-| `bind` | Interface addresses to listen on, e.g. `["127.0.0.1"]`. `[]` listens on every interface; loopback plus a tunnel keeps the port off the network. |
-| `open_server` | `true`: anyone holding the server public key can connect. `false`: only devices in `allowed_clients`. Encrypted either way. |
-| `agents` | At least one — see below. |
+```bash
+python3 reinbox_server.py
+```
 
-### Optional
+On first startup, the server creates `config.key` and prints its public key as
+text and a QR code. Add a server in the app with an address it can reach, then
+scan or paste the printed key.
 
-| Key | Meaning |
-|---|---|
-| `port` | HTTP port. Default 16861. |
-| `base_path` | Sub-path when behind a reverse proxy, e.g. `"/reinbox"` for `https://host/reinbox → localhost:16861`. |
-| `allowed_clients` | Closed mode: client public keys. Each device shows its key in the app; remove a key to revoke that device. |
-| `private_key_file` | Path to the server's key file. Default `<config>.key`. |
+Keep `config.key` private and back it up: it holds the server's identity.
+Restart the server after changing its configuration. To use a different config:
 
-### Agents
+```bash
+python3 reinbox_server.py /path/to/config.json
+```
 
-One entry per agent: `type` (`claude`/`codex`), `name`, `path` (executable),
-`models`, `efforts`, `args`, plus:
+## Using your agents
 
-- `scope` — `"workspace"`: only sessions under `root_dir`. `"global"`: every
-  session of that agent wherever it ran, and runs in any directory the service
-  user can reach. Global is the widest setting an agent can have.
-- `home_dir` — the agent's data directory, when it isn't the stock one
-  (`~/.claude`, `~/.codex`). Two agents of the same type are told apart by it;
-  without one, the first listed owns the shared store.
+In the app, choose an agent and project directory, then send a prompt. Replies
+and tool output appear as the agent works. You can reply to an existing session,
+cancel a run, and send or download files.
 
-The server hard-codes `-p --output-format stream-json --verbose` for Claude,
-`exec --json --skip-git-repo-check` for codex, and the per-turn values picked in
-the app (model, effort, resume). Everything else comes verbatim from `args`,
-including the permission flags in the template — `--permission-mode
-bypassPermissions` and `--dangerously-bypass-approvals-and-sandbox`. Runs are
-asynchronous and non-interactive: nobody is at the terminal, so an agent that
-stops to ask for permission stalls until it is cancelled.
+Sessions started directly in a supported CLI are imported at startup and when
+you refresh the app. Refreshing imports history without sending a notification.
+To refresh and notify connected clients of the latest fresh reply, run:
 
-`args` is argv: one entry per argument, so a codex config override is two
-entries, `"-c"` and `"key=value"`. An entry with no leading flag is taken as
-the prompt.
+```bash
+python3 reinbox_server.py --notify
+```
 
-## Security
+This contacts the running server and includes the full final response in the
+notification event. An optional config path selects the server to contact.
 
-A paired client can execute arbitrary code as the user running Reinbox. Reinbox
-authenticates devices and encrypts traffic; it does not authorize individual
-operations. Pairing is the whole trust boundary — treat a paired device as a
-shell on the machine and draw the line in the OS: a dedicated unprivileged user,
-container or VM, reaching only the intended workspace and agent data, with no
-sudo, personal SSH keys or cloud credentials.
+### Agent settings
 
-All traffic is AES-256-GCM encrypted end to end in both modes, keys included.
-Every request carries a one-time HMAC signature binding its method, path, query
-and body.
+Each entry in `agents` selects a `type` (`claude`, `codex`, or `grok`), `name`,
+and executable `path`. The other useful settings are:
 
-- **Open** (`open_server: true`) — the encryption keys derive from the server
-  public key, so holding that key is the credential.
-- **Closed** — every device gets its own ECDH-derived keys from the public key
-  listed in `allowed_clients`. Registered devices keep working if the server is
-  later flipped open.
+| Setting | Purpose |
+| --- | --- |
+| `scope` | `workspace` limits sessions to `root_dir`; `global` includes sessions outside it and allows runs in other accessible directories. |
+| `home_dir` | Selects a custom CLI data directory. An empty value uses the CLI's default location. |
+| `models`, `efforts` | The choices offered in the app. Set these to values your CLI supports. |
+| `args` | Extra CLI arguments, one list entry per argument. |
 
-`config.key` is the server identity: delete it and every client must re-scan.
+The server uses each CLI's own authentication and permission settings. Runs
+are non-interactive; permission prompts cannot be answered through the app.
+The Grok example adds no permission-bypass option.
 
-Any TCP route to the port works — LAN, VPN (Tailscale, WireGuard), an SSH
-forward, or a reverse-proxy tunnel. For a sub-path route set `base_path`.
+## Access and permissions
 
-## Terminal & cron runs
+Only give access to devices you trust to run code on the server machine.
+Consider a dedicated OS account with access limited to your projects and agent
+data.
 
-Sessions that don't start from the app reach it in two ways:
+- **Open mode** (`open_server: true`): possession of the server public key grants
+  access. Treat the printed key as an access credential.
+- **Closed mode** (`open_server: false`): add each device's public key from the
+  app to `allowed_clients`.
 
-1. **Silent pickup (automatic).** Anything run with the plain `claude` / `codex`
-   CLIs is imported by reconciliation on the app's next refresh, without a
-   notification.
-2. **`--notify` (deliberate signal).** Tells the running server to reconcile now
-   and push a notification carrying the **full final response** of the latest
-   fresh reply (the text the terminal printed — steps excluded).
+Authenticated requests are signed; conversation responses and WebSocket
+messages are encrypted. Restrict network access with a VPN, tunnel, or firewall.
+For a reverse proxy, enable WebSocket forwarding and set `base_path` if serving
+under a path such as `/reinbox`.
 
-   ```bash
-   python3 reinbox_server.py --notify            # [config.json] if not the default
-   # cron, with a plain CLI run:
-   0 3 * * * claude -p "nightly refresh" ... ; /usr/bin/python3 /opt/reinbox-server/reinbox_server.py --notify
-   ```
+## Stored data
+
+Conversations live in the SQLite database at `db_path`. The CLIs also keep their
+own transcript stores. Back up the database using SQLite's backup facility, or
+stop the server before copying it. Preserve the config, server key, and CLI data
+when moving to another machine.
+
+**Deleting a session also deletes its associated CLI transcripts.** Grok
+cleanup removes the session directory and its local search entry; shared prompt
+history is retained.
+
+## Development
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## License
+
+[MIT](LICENSE)

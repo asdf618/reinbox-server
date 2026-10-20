@@ -51,6 +51,27 @@
         "--dangerously-bypass-approvals-and-sandbox"
       ],
       "home_dir": ""
+    },
+    {
+      "type": "grok",
+      "name": "Grok",
+      "scope": "workspace",
+      "path": "/usr/local/bin/grok",
+      "models": [
+        "grok-4.7",
+        "grok-4.7-build-fast",
+        "grok-4.6"
+      ],
+      "efforts": [
+        "medium",
+        "low",
+        "high",
+        "xhigh"
+      ],
+      "args": [
+        "--no-auto-update"
+      ],
+      "home_dir": ""
     }
   ]
 }
